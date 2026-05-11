@@ -18,6 +18,16 @@ Based on [Tiny386](https://github.com/hchunhui/tiny386) by Chunhui He.
 - NES gamepad support with mouse emulation mode
 - Boots DOS, Windows 3.x, **Windows 95**, Linux, and more
 
+## Screenshots
+
+### FRANK 386 in Action
+
+![Screenshot 1](screenshots/screen1.png)
+![Screenshot 2](screenshots/screen2.png)
+![Screenshot 3](screenshots/screen3.png)
+![Screenshot 4](screenshots/screen4.png)
+![Screenshot 5](screenshots/screen5.png)
+
 ## Supported Boards
 
 This firmware is designed for RP2350-based boards with integrated VGA/HDMI, SD card, and keyboard input:
