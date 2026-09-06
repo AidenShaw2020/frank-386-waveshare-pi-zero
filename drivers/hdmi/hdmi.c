@@ -94,6 +94,9 @@ extern volatile uint32_t frame_update_request;
 /* Fixed-scanline palette sample; see FRANK_VGA_PALETTE_SAMPLE_POINT in
  * drivers/vga/vga_hw.c. */
 void vga_hw_snapshot_palette16(void);
+static void hdmi_pal_track(void);
+void vga_get_palette16(VGAState *s, uint8_t *palette16);
+void vga_hw_set_palette16(const uint8_t *palette16_data);
 #define HDMI_PALETTE_SAMPLE_LINE 240u
 extern const uint32_t * volatile hdmi_ega320_cache_active;
 extern const uint32_t * volatile hdmi_ega320_cache_pending;
@@ -126,6 +129,63 @@ static uint32_t hdmi_extra_line_buf[2][100];
 //в хвосте этой памяти выделяется dma_data
 alignas(4096) uint32_t conv_color[1224];
 uint32_t conv_color2[1024]; // backup to fast restore pallete
+
+/*
+ * FRANK_HDMI_RASTER_SPLIT
+ *
+ * conv_color[0..1023] is the whole 256-entry pair table the PIO looks a pixel
+ * byte up in, and it is one table for the whole frame.  A game that changes
+ * the palette mid-frame - one palette for a playfield and another for a
+ * status bar below it - cannot be drawn with a single table, and until now
+ * the renderer simply picked whichever palette happened to be current when
+ * its once-per-frame rebuild ran.
+ *
+ * Lemmings is the case: two complete palettes, alternating 160 times a
+ * second, 85% of the frame in one and 11% in the other.  Sampling at a fixed
+ * scanline stopped the whole screen from flickering between them, but left
+ * the status bar drawn in the playfield's colours.
+ *
+ * So the sixteen TMDS-encoded colours of each palette are cached, keyed by
+ * the guest palette they came from, and the scanline ISR expands the right
+ * set back over conv_color when the guest changes palette part way down the
+ * frame.  Only the encoded colours are kept, not the built table: caching two
+ * whole 4 KB tables cost 8 KB of SRAM and the board came up on a black
+ * screen, while 16 colours are 128 bytes and expanding them into the 256 pair
+ * entries is a couple of stores each - the same order of cost as the copy
+ * would have been.
+ *
+ * TMDS encoding, and the nearest-colour search that picks substitutes for the
+ * four reserved byte values, are not affordable in an ISR; the ISR captures
+ * the palette and asks, and the main loop does that part.
+ */
+#define HDMI_PALSPLIT_SLOTS 3
+typedef struct {
+    uint32_t hash;
+    uint8_t  pal16[48];
+    uint8_t  have_pal;   /* palette captured, colours not encoded yet */
+    uint8_t  built;      /* enc[] is valid for hash */
+    uint64_t enc[16];    /* TMDS words for the sixteen colours */
+} hdmi_palslot_t;
+static hdmi_palslot_t hdmi_palslot[HDMI_PALSPLIT_SLOTS];
+static uint32_t hdmi_pal_live_hash;   /* whose colours are in conv_color now */
+static uint32_t hdmi_pal_last_gen;    /* VGAState.palette_gen last looked at */
+static uint8_t  hdmi_pal_settle;      /* a burst ended on the previous line */
+static unsigned hdmi_pal_next_slot;   /* round robin */
+static volatile bool hdmi_pal_build_pending;
+
+/* Cheap and only ever computed when the guest has touched the palette since
+ * the previous scanline.  It has to cover the attribute registers too: they
+ * are the indirection from a pixel value to a DAC entry, so two different
+ * screens can share DAC contents and differ only here. */
+static uint32_t __not_in_flash_func(hdmi_pal_hash)(const VGAState *v) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 48; i++) h = (h ^ v->palette[i]) * 16777619u;
+    for (int i = 0; i < 16; i++) h = (h ^ v->ar[i]) * 16777619u;
+    h = (h ^ v->ar[0x10]) * 16777619u;
+    h = (h ^ v->ar[0x14]) * 16777619u;
+    return h ? h : 1u;
+}
+
 bool required_to_repair_text_pal = false;
 
 //индекс, проверяющий зависание
@@ -1190,6 +1250,10 @@ static void __time_critical_func(dma_handler_HDMI)() {
     if (line == HDMI_PALETTE_SAMPLE_LINE)
         vga_hw_snapshot_palette16();
 
+    /* Follow a mid-frame palette change; see FRANK_HDMI_RASTER_SPLIT. */
+    if (gfx_submode == 2 && line < 480)
+        hdmi_pal_track();
+
     // Update VGA status register 1 (port 0x3DA) from ISR
     if (vga_state) {
         /* Start this line's horizontal blanking; the 0x3DA read path
@@ -1652,6 +1716,134 @@ void graphics_set_palette_hdmi2(
     uint64_t c2 = get_ser_diff_data(tmds_encoder(R2), tmds_encoder(G2), tmds_encoder(B2));
     conv_color64[i * 2]     = c1;
     conv_color64[i * 2 + 1] = (c1 == c2) ? (c2 ^ HDMI_DC_BAL_XOR) : c2;
+}
+
+/* The same 6-bit to 8-bit expansion vga_hw.c uses, which is not simply a
+ * shift: the low bit is replicated so that 0x3f maps to 0xff. */
+static inline int hdmi_c6_to_8(int v) {
+    v &= 0x3f;
+    int b = v & 1;
+    return (v << 2) | (b << 1) | b;
+}
+
+/*
+ * Write the 256-entry pair table from sixteen encoded colours.  Same shape as
+ * graphics_set_palette_hdmi2(), minus the encoding: entry (hi<<4)|lo holds
+ * the two pixels of that byte, and the reserved HDMI control bytes are left
+ * alone exactly as that function leaves them.
+ */
+static void __not_in_flash_func(hdmi_pal_expand)(const uint64_t *enc) {
+    uint64_t *cc = (uint64_t *)conv_color;
+    for (unsigned hi = 0; hi < 16u; hi++) {
+        uint64_t c1 = enc[hi];
+        for (unsigned lo = 0; lo < 16u; lo++) {
+            unsigned i = (hi << 4) | lo;
+            if is_hdmi_sync(i) continue;
+            uint64_t c2 = enc[lo];
+            cc[i * 2]     = c1;
+            cc[i * 2 + 1] = (c1 == c2) ? (c2 ^ HDMI_DC_BAL_XOR) : c2;
+        }
+    }
+}
+
+/* Scanline hook.  Returns with conv_color holding the table for whatever the
+ * guest's palette is now, if one has been built. */
+static void __not_in_flash_func(hdmi_pal_track)(void) {
+    VGAState *v = vga_state;
+    if (!v) return;
+    /*
+     * Wait for the write burst to finish before believing what is in the
+     * palette.  Sixteen entries are forty-eight port writes spread over
+     * several scanlines, and every intermediate state hashes differently:
+     * acting on those captured half-written palettes as if they were real
+     * ones, and evicted the two that were.  One line of quiet is enough, and
+     * it also means the hash is computed once per change rather than per
+     * line.
+     */
+    uint32_t gen = v->palette_gen;
+    if (gen != hdmi_pal_last_gen) {
+        hdmi_pal_last_gen = gen;
+        hdmi_pal_settle = 1;
+        return;
+    }
+    if (!hdmi_pal_settle) return;
+    hdmi_pal_settle = 0;
+
+    uint32_t h = hdmi_pal_hash(v);
+    if (h == hdmi_pal_live_hash) return;
+
+    for (unsigned i = 0; i < HDMI_PALSPLIT_SLOTS; i++) {
+        if (hdmi_palslot[i].hash == h) {
+            if (hdmi_palslot[i].built) {
+                hdmi_pal_expand(hdmi_palslot[i].enc);
+                hdmi_pal_live_hash = h;
+            }
+            return;
+        }
+    }
+    /* Unknown palette: capture it and let the main loop build the table. */
+    unsigned k = hdmi_pal_next_slot;
+    hdmi_pal_next_slot = (k + 1u) % HDMI_PALSPLIT_SLOTS;
+    hdmi_palslot[k].built = 0;
+    hdmi_palslot[k].hash = h;
+    vga_get_palette16(v, hdmi_palslot[k].pal16);
+    hdmi_palslot[k].have_pal = 1;
+    hdmi_pal_build_pending = true;
+}
+
+/*
+ * Main-loop half: build any captured palette that has no table yet.
+ *
+ * vga_hw_set_palette16() writes conv_color in place, so the build is done
+ * there and then copied out.  That leaves the freshly built palette live,
+ * which is correct: hdmi_pal_track() puts the right one back at the next
+ * scanline the guest changes it on.
+ */
+void hdmi_palette_build_pending(void) {
+    if (!hdmi_pal_build_pending) return;
+    hdmi_pal_build_pending = false;
+    for (unsigned i = 0; i < HDMI_PALSPLIT_SLOTS; i++) {
+        hdmi_palslot_t *sl = &hdmi_palslot[i];
+        if (!sl->have_pal || sl->built) continue;
+        for (unsigned k = 0; k < 16u; k++)
+            sl->enc[k] = get_ser_diff_data(tmds_encoder(hdmi_c6_to_8(sl->pal16[k * 3 + 0])),
+                                           tmds_encoder(hdmi_c6_to_8(sl->pal16[k * 3 + 1])),
+                                           tmds_encoder(hdmi_c6_to_8(sl->pal16[k * 3 + 2])));
+        /* This also picks the substitutes for the four reserved byte values,
+         * which are global state: the last palette built wins, and with two
+         * palettes that can put a near colour on at most four of the 256
+         * pair values. */
+        vga_hw_set_palette16(sl->pal16);
+        sl->built = 1;
+        hdmi_pal_live_hash = sl->hash;
+    }
+}
+
+/*
+ * True once a genuine split has been seen, i.e. two different palettes have
+ * both been built.  Until then the once-per-frame rebuild in
+ * vga_hw_process_deferred() stays in charge, so a screen with a single
+ * palette behaves exactly as it did before any of this existed.
+ */
+bool hdmi_palette_split_active(void) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < HDMI_PALSPLIT_SLOTS; i++)
+        if (hdmi_palslot[i].built) n++;
+    return n >= 2u;
+}
+
+/* Forget everything on a mode or submode change: the table layout itself
+ * differs between submode 2 and the 320-wide modes. */
+void hdmi_palette_split_reset(void) {
+    for (unsigned i = 0; i < HDMI_PALSPLIT_SLOTS; i++) {
+        hdmi_palslot[i].hash = 0;
+        hdmi_palslot[i].have_pal = 0;
+        hdmi_palslot[i].built = 0;
+    }
+    hdmi_pal_live_hash = 0;
+    hdmi_pal_next_slot = 0;
+    hdmi_pal_build_pending = false;
+    hdmi_pal_last_gen = vga_state ? vga_state->palette_gen : 0u;
 }
 
 #define RGB888(r, g, b) ((r<<16) | (g << 8 ) | b )
