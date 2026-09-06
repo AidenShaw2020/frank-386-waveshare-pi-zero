@@ -305,6 +305,11 @@ static inline int c6_to_8(int v)
 }
 
 void graphics_set_palette_hdmi(const uint8_t R, const uint8_t G, const uint8_t B,  uint8_t i);
+/* Raster-split palette cache; see FRANK_HDMI_RASTER_SPLIT in
+ * drivers/hdmi/hdmi.c. */
+void hdmi_palette_build_pending(void);
+bool hdmi_palette_split_active(void);
+void hdmi_palette_split_reset(void);
 void graphics_set_palette_hdmi2(
     const uint8_t R1, const uint8_t G1, const uint8_t B1,
     const uint8_t R2, const uint8_t G2, const uint8_t B2,
@@ -1208,7 +1213,12 @@ static void vga_hw_new_frame_deferred(void) {
          * when entering/changing the graphics mode.
          */
         if (new_gfx_submode == 2 || new_gfx_submode == 6) {
-            if (palette_dirty || mode_changed || submode_changed) {
+            if (!SELECT_VGA && (mode_changed || submode_changed))
+                hdmi_palette_split_reset();
+            /* Once two palettes are cached the split machinery owns
+             * conv_color and rebuilding here would fight it. */
+            if ((palette_dirty || mode_changed || submode_changed) &&
+                (SELECT_VGA || !hdmi_palette_split_active())) {
                 /* The snapshot is handed over directly.  Copying it into a
                  * local first, and skipping the rebuild when it had not
                  * changed, cost 188 bytes of .data here - and .data had 260
@@ -1967,7 +1977,22 @@ void __time_critical_func(vga_hw_set_gfx_mode)(int submode, int width, int heigh
 
 extern uint32_t conv_color[1224], conv_color2[1024];
 
-void __not_in_flash_func(vga_hw_process_deferred)(void) {
+/*
+ * Deliberately in flash.  This runs once per frame from the main loop, never
+ * from an ISR, and at 1020 bytes it was the single largest thing standing
+ * between .data and the 4 KB boundary .bss is aligned to.  Moving it out is
+ * what makes room for the raster-split palette work below; leaving it in RAM
+ * left 124 bytes of headroom, and 312 bytes of growth had already put the
+ * board on a black screen once.
+ */
+void vga_hw_process_deferred(void) {
+    /* Build any palette the scanline ISR captured; see
+     * FRANK_HDMI_RASTER_SPLIT in drivers/hdmi/hdmi.c.  Cheap when idle, and
+     * it must run every pass, not only at end of frame, because the split
+     * that needs the table happens in the middle of one. */
+    if (!SELECT_VGA)
+        hdmi_palette_build_pending();
+
     if (!frame_update_request)
         return;
     frame_update_request = 0;

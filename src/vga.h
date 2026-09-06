@@ -139,6 +139,10 @@ struct VGAState {
     uint8_t dac_cache[3]; /* used when writing */
     uint8_t palette[768];
     int palette_dirty;    /* set when palette is modified */
+    /* Bumped alongside palette_dirty and never cleared.  The display ISR
+     * reads it once per scanline to notice a mid-frame palette change
+     * cheaply; see FRANK_HDMI_RASTER_SPLIT in drivers/hdmi/hdmi.c. */
+    uint32_t palette_gen;
     int32_t bank_offset;
 
     uint32_t latch;

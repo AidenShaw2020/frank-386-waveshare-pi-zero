@@ -1519,11 +1519,11 @@ void __not_in_flash_func(vga_ioport_write)(VGAState *s, uint32_t addr, uint32_t 
             switch(index) {
             case 0x00 ... 0x0f:
                 s->ar[index] = val & 0x3f;
-                s->palette_dirty = 1;  // Palette index mapping changed
+                s->palette_dirty = 1; s->palette_gen++;  // Palette index mapping changed
                 break;
             case 0x10:
                 s->ar[index] = val & ~0x10;
-                s->palette_dirty = 1;  // Affects palette selection
+                s->palette_dirty = 1; s->palette_gen++;  // Affects palette selection
                 break;
             case 0x11:
                 s->ar[index] = val;
@@ -1536,7 +1536,7 @@ void __not_in_flash_func(vga_ioport_write)(VGAState *s, uint32_t addr, uint32_t 
                 break;
             case 0x14:
                 s->ar[index] = val & ~0xf0;
-                s->palette_dirty = 1;  // Affects palette color select
+                s->palette_dirty = 1; s->palette_gen++;  // Affects palette color select
                 break;
             default:
                 break;
@@ -1571,7 +1571,7 @@ void __not_in_flash_func(vga_ioport_write)(VGAState *s, uint32_t addr, uint32_t 
         s->dac_cache[s->dac_sub_index] = val;
         if (++s->dac_sub_index == 3) {
             memcpy(&s->palette[s->dac_write_index * 3], s->dac_cache, 3);
-            s->palette_dirty = 1;
+            s->palette_dirty = 1; s->palette_gen++;
             s->dac_sub_index = 0;
             s->dac_write_index++;
         }
@@ -2519,7 +2519,7 @@ static void vga_initmode(VGAState *s)
     njit_vga_arena_release();
     for (int i = 0; i < 64*3; i++)
         s->palette[i] = pal_ega[i];
-    s->palette_dirty = 1;
+    s->palette_dirty = 1; s->palette_gen++;
 
     for (int i = 0; i <= 0x13; i++)
         s->ar[i] = actl[i];
