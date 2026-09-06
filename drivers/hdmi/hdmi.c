@@ -91,6 +91,10 @@ extern int gfx_line_offset;  // Words per line (40 for 320px EGA, 80 for 640px)
 extern int gfx_sram_stride;  // Words per line in SRAM buffer (width/8 + 1)
 
 extern volatile uint32_t frame_update_request;
+/* Fixed-scanline palette sample; see FRANK_VGA_PALETTE_SAMPLE_POINT in
+ * drivers/vga/vga_hw.c. */
+void vga_hw_snapshot_palette16(void);
+#define HDMI_PALETTE_SAMPLE_LINE 240u
 extern const uint32_t * volatile hdmi_ega320_cache_active;
 extern const uint32_t * volatile hdmi_ega320_cache_pending;
 
@@ -1183,8 +1187,15 @@ static void __time_critical_func(dma_handler_HDMI)() {
         }
     }
 
+    if (line == HDMI_PALETTE_SAMPLE_LINE)
+        vga_hw_snapshot_palette16();
+
     // Update VGA status register 1 (port 0x3DA) from ISR
     if (vga_state) {
+        /* Start this line's horizontal blanking; the 0x3DA read path
+         * derives Display Enable from it so that a guest counting
+         * scanlines counts real ones. */
+        vga_state->hblank_until = get_uticks() + VGA_HBLANK_US;
         if (line >= 480) {
             vga_state->st01 |=  ST01_V_RETRACE;
             vga_state->st01 &= ~ST01_DISP_ENABLE;

@@ -33,6 +33,7 @@
 #include <assert.h>
 
 #include "vga.h"
+#include "njit_vga_arena.h"
 #include "codeprofile.h"
 #include "pci.h"
 
@@ -432,6 +433,132 @@ static bool vbe_enabled(VGAState *s)
 }
 
 /*
+ * Tell the native JIT whether the 0xA0000 aperture is currently plain linear
+ * memory; see the njit_vga_hook comment in njit_vga_arena.h for what each
+ * condition protects.  Called from every function in this file that writes
+ * sr[] or gr[] - vga_ioport_write(), vbe_update_vgaregs() and vga_initmode()
+ * - which is cheap, because those are port writes and mode sets rather than
+ * memory accesses.
+ */
+volatile struct njit_vga_write njit_vga_write[3];
+
+/*
+ * Why the direct aperture path is off, for the host tools.  Every early
+ * return below has its own code, because "the table is zero" says nothing
+ * about which of eight conditions refused and guessing wasted a build.
+ */
+uint32_t g_njit_vga_why __attribute__((used));
+uint32_t g_njit_vga_regs __attribute__((used));
+
+static void njit_vga_write_update(VGAState *s)
+{
+    g_njit_vga_why = 1;
+    static const uint32_t sizes[3] = { 1, 2, 4 };
+
+    for (int i = 0; i < 3; i++) {
+        njit_vga_write[i].ram = NULL;
+        njit_vga_write[i].shift = 0;
+        njit_vga_write[i].limit = 0;
+    }
+    if (!s->vga_ram || s->vga_ram_size <= 0)
+        { g_njit_vga_why = 2; return; }
+
+    /* Never let a native store reach the region lent to the JIT. */
+    uint32_t top = (uint32_t)s->vga_ram_size;
+    if (top > NJ_VGA_ARENA_OFF)
+        top = NJ_VGA_ARENA_OFF;
+
+    unsigned map = (s->gr[VGA_GFX_MISC] >> 2) & 3;
+    /* The four registers this decision is made from, for the host tools. */
+    g_njit_vga_regs = (uint32_t)s->sr[VGA_SEQ_MEMORY_MODE]
+                    | ((uint32_t)s->sr[VGA_SEQ_PLANE_WRITE] << 8)
+                    | ((uint32_t)s->gr[VGA_GFX_MISC] << 16)
+                    | ((uint32_t)s->gr[VGA_GFX_MODE] << 24);
+
+    if (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) {
+        /* Chain 4: vga_ram[addr], every size, provided nothing is masked.
+         *
+         * Mapping mode 1 is admitted as well, and that is what mode 13h
+         * actually uses - the BIOS points the aperture at A0000..AFFFF rather
+         * than the full 128 KB, so `map != 0` refused every one of Doom's
+         * framebuffer writes.  Measured in its rendering phase: 270 218 guard
+         * side exits in fifteen seconds on aperture writes, 62% of every
+         * refusal the generated code made.
+         *
+         * The mapping is the same one the planar path below already handles:
+         * the window halves and bank_offset is added before the mode split,
+         * so folding the bank into the base pointer and clamping the span to
+         * 64 KB reproduces vga_mem_write() exactly.  `top` is already clamped
+         * to NJ_VGA_ARENA_OFF, so a native store still cannot reach the
+         * region lent to the JIT, and a bank change calls this function.
+         */
+        if (map != 0 && map != 1)
+            { g_njit_vga_why = 3; return; }
+        if ((s->sr[VGA_SEQ_PLANE_WRITE] & 0x0f) != 0x0f)
+            { g_njit_vga_why = 4; return; }
+        uint32_t bank = map == 1 ? (uint32_t)s->bank_offset : 0;
+        if (bank >= top)
+            { g_njit_vga_why = 5; return; }
+        uint32_t window = map == 1 ? 0x10000u : 0x20000u;
+        uint32_t span = top - bank;
+        if (span > window)
+            span = window;
+        g_njit_vga_why = 0;
+        for (int i = 0; i < 3; i++) {
+            if (span < sizes[i])
+                continue;
+            njit_vga_write[i].ram = s->vga_ram + bank;
+            njit_vga_write[i].shift = 0;
+            njit_vga_write[i].limit = span - sizes[i];
+        }
+        { g_njit_vga_why = 6; return; }
+    }
+
+    if (s->gr[VGA_GFX_MODE] & 0x10)
+        return;                         /* odd/even (text) mapping */
+
+    /*
+     * The latched path stores the value unchanged only when write mode 0 is
+     * doing nothing to it: no rotate, no logical function (both live in
+     * gr[VGA_GFX_DATA_ROTATE]), no set/reset, and a bit mask that keeps every
+     * bit of the new value rather than any of the latch.
+     */
+    if ((s->gr[VGA_GFX_MODE] & 3) != 0)
+        { g_njit_vga_why = 7; return; }
+    if (s->gr[VGA_GFX_DATA_ROTATE] != 0)
+        { g_njit_vga_why = 8; return; }
+    if (s->gr[VGA_GFX_SR_ENABLE] & 0x0f)
+        { g_njit_vga_why = 9; return; }
+    if (s->gr[VGA_GFX_BIT_MASK] != 0xff)
+        { g_njit_vga_why = 10; return; }
+
+    /* Exactly one plane, so the dword read-modify-write is one byte store. */
+    unsigned planes = s->sr[VGA_SEQ_PLANE_WRITE] & 0x0f;
+    if (planes == 0 || (planes & (planes - 1)) != 0)
+        { g_njit_vga_why = 11; return; }
+    unsigned plane = planes == 1 ? 0 : planes == 2 ? 1 : planes == 4 ? 2 : 3;
+
+    /* Mapping mode 1 adds bank_offset to the address and halves the window;
+     * the interpreter adds it before the mode split, so it counts in dwords
+     * here exactly as it does there. */
+    if (map != 0 && map != 1)
+        { g_njit_vga_why = 12; return; }
+    uint32_t bank = map == 1 ? (uint32_t)s->bank_offset : 0;
+    uint32_t words = top / 4u;
+    if (!words || bank >= words)
+        { g_njit_vga_why = 13; return; }
+    uint32_t last = words - 1u - bank;
+    uint32_t window = map == 1 ? 0xffffu : 0x1ffffu;
+    if (last > window)
+        last = window;
+
+    g_njit_vga_why = 0;
+    njit_vga_write[0].ram = s->vga_ram + bank * 4u + plane;
+    njit_vga_write[0].shift = 2;
+    njit_vga_write[0].limit = last;
+}
+
+/*
  * Sanity check vbe register writes.
  *
  * As we don't have a way to signal errors to the guest in the bochs
@@ -558,6 +685,7 @@ static void vbe_update_vgaregs(VGAState *s)
     s->gr[VGA_GFX_MODE] = (s->gr[VGA_GFX_MODE] & ~0x60) |
         (shift_control << 5);
     s->cr[VGA_CRTC_MAX_SCAN] &= ~0x9f; /* no double scan */
+    njit_vga_write_update(s);
 }
 
 /* the text refresh is just for debugging and initial boot message, so
@@ -1181,6 +1309,9 @@ void __not_in_flash_func(vga_refresh)(VGAState *s,
 
     if (graphic_mode != s->graphic_mode) {
         s->graphic_mode = graphic_mode;
+        /* A released region stays released until something says the mode has
+         * changed; this is that something.  It only sets a flag. */
+        njit_vga_arena_rearm();
         full_update = 1;
         s->cursor_blink_time = get_uticks();
 #ifndef RP2350_BUILD
@@ -1242,9 +1373,40 @@ uint32_t __not_in_flash_func(vga_ioport_read)(VGAState *s, uint32_t addr)
      * Some games (like Goblins) poll 0x3BA for vertical retrace even in color mode.
      * Update retrace status on each read so tight polling loops see changes. */
     if (addr == 0x3ba || addr == 0x3da) {
-        /* st01 is updated by the VGA ISR on every scanline — just return it.
-         * Wolf3D polling this port sees exact hardware vblank timing. */
-        val = s->st01;
+        /* The vertical retrace bit comes from the VGA/HDMI ISR, which has the
+         * real display timing, so Wolf3D polling this port still sees exact
+         * hardware vblank timing.
+         *
+         * Bit 0 cannot come from there.  It is Display Enable NOT: on real
+         * hardware it reads 1 during horizontal *and* vertical blanking and
+         * therefore toggles once per scanline.  A per-frame ISR can only hold
+         * it steady across the whole active area, and it held the opposite
+         * polarity as well, so a game that counts scanlines by watching this
+         * bit counted frames instead.  Lemmings does exactly that - sixty
+         * iterations of "wait for active, wait for blanking" to find the line
+         * its split screen starts on - which cost sixty frames per game frame
+         * and made the game roughly five hundred times too slow.
+         *
+         * So the horizontal component is derived here from the display
+         * ISR's own scanline clock.  It has to be that clock and not a
+         * free-running one: Lemmings counts sixty scanlines from the end of
+         * vertical retrace and reloads the palette there, for the split
+         * between its level view and its status bar.  A phase unrelated to
+         * the real scanout put that reload at a different screen position
+         * every frame, which showed as coloured fragments flickering across
+         * the level - the drawing was correct and provably static, and only
+         * the palette moved. */
+        uint32_t now = get_uticks();
+        bool hblank;
+        if (now - s->hblank_until < VGA_HBLANK_STALE_US)
+            hblank = false;                      /* line already past blanking */
+        else if (s->hblank_until - now <= VGA_HBLANK_US)
+            hblank = true;                       /* inside this line's blanking */
+        else
+            hblank = (now & 31u) < 6u;           /* no ISR running: free-run */
+        val = s->st01 & ~ST01_DISP_ENABLE;
+        if ((val & ST01_V_RETRACE) || hblank)
+            val |= ST01_DISP_ENABLE;
         s->ar_flip_flop = 0;
         goto done;
     }
@@ -1393,6 +1555,7 @@ void __not_in_flash_func(vga_ioport_write)(VGAState *s, uint32_t addr, uint32_t 
         printf("vga: write SR%x = 0x%02x\n", s->sr_index, val);
 #endif
         s->sr[s->sr_index] = val & sr_mask[s->sr_index];
+        njit_vga_write_update(s);
         break;
     case 0x3c7:
         s->dac_read_index = val;
@@ -1421,6 +1584,7 @@ void __not_in_flash_func(vga_ioport_write)(VGAState *s, uint32_t addr, uint32_t 
         printf("vga: write GR%x = 0x%02x\n", s->gr_index, val);
 #endif
         s->gr[s->gr_index] = val & gr_mask[s->gr_index];
+        njit_vga_write_update(s);
         break;
     case 0x3b4:
     case 0x3d4:
@@ -1498,6 +1662,7 @@ void vbe_write(VGAState *s, uint32_t offset, uint32_t val)
             vbe_update_vgaregs(s);
             /* clear the screen */
             if (!(val & VBE_DISPI_NOCLEARMEM)) {
+                njit_vga_arena_release();
                 memset(s->vga_ram, 0,
                        s->vbe_regs[VBE_DISPI_INDEX_YRES] * s->vbe_line_offset);
             }
@@ -1517,6 +1682,7 @@ void vbe_write(VGAState *s, uint32_t offset, uint32_t val)
             val &= (s->vga_ram_size >> 16) - 1;
             s->vbe_regs[s->vbe_index] = val;
             s->bank_offset = (val << 16);
+            njit_vga_write_update(s);
             break;
         }
     }
@@ -1667,6 +1833,10 @@ void IRAM_ATTR vga_mem_write16(VGAState *s, uint32_t addr, uint16_t val16)
         break;
     }
 
+        /* VBE banking puts bank_offset up to 0x30000 on top of a 64 KB
+         * window, so even this unchecked chain-4 store can reach the
+         * region lent to the JIT.  See njit_vga_arena.h. */
+        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
     /* chain 4 mode : simplest access */
     plane = addr & 3;
     mask = (1 << plane);
@@ -1715,6 +1885,10 @@ void IRAM_ATTR vga_mem_write32(VGAState *s, uint32_t addr, uint32_t val)
         break;
     }
 
+        /* VBE banking puts bank_offset up to 0x30000 on top of a 64 KB
+         * window, so even this unchecked chain-4 store can reach the
+         * region lent to the JIT.  See njit_vga_arena.h. */
+        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
     /* chain 4 mode : simplest access */
     plane = addr & 3;
     mask = (1 << plane);
@@ -1758,6 +1932,7 @@ bool IRAM_ATTR vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, in
         break;
     }
 
+    if (addr + (uint32_t)len > NJ_VGA_ARENA_OFF) njit_vga_arena_release();
     /* chain 4 mode : simplest access */
     plane = addr & 3;
     mask = (1 << plane);
@@ -1808,6 +1983,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         plane = addr & 3;
         mask = (1 << plane);
         if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
+            if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
             s->vga_ram[addr] = val;
 #ifdef DEBUG_VGA_MEM
             printf("vga: chain4: [0x" TARGET_FMT_plx "]\n", addr);
@@ -1821,6 +1997,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         mask = (1 << plane);
         if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
             addr = ((addr & ~1) << 1) | plane;
+            if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
             if (addr >= s->vga_ram_size) {
                 return;
             }
@@ -1897,6 +2074,11 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         mask = s->sr[VGA_SEQ_PLANE_WRITE];
 //        s->plane_updated |= mask; /* only used to detect font change */
         write_mask = mask16[mask];
+        /* The only path in this file that can reach the JIT's borrowed region
+         * at the top of the buffer; chain 4 and odd/even are both bounded
+         * below byte 131072.  See njit_vga_arena.h. */
+        if (addr * sizeof(uint32_t) >= NJ_VGA_ARENA_OFF)
+            njit_vga_arena_release();
         if (addr * sizeof(uint32_t) >= s->vga_ram_size) {
             return;
         }
@@ -1944,17 +2126,21 @@ uint8_t __not_in_flash_func(vga_mem_read)(VGAState *s, uint32_t addr)
     if (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) {
         /* chain 4 mode : simplest access */
 //        assert(addr < s->vram_size);
+        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
         ret = s->vga_ram[addr];
     } else if (s->gr[VGA_GFX_MODE] & 0x10) {
         /* odd/even mode (aka text mode mapping) */
         plane = (s->gr[VGA_GFX_PLANE_READ] & 2) | (addr & 1);
         addr = ((addr & ~1) << 1) | plane;
+        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
         if (addr >= s->vga_ram_size) { // s->vram_size) {
             return 0xff;
         }
         ret = s->vga_ram[addr];
     } else {
         /* standard VGA latched access */
+        if (addr * sizeof(uint32_t) >= NJ_VGA_ARENA_OFF)
+            njit_vga_arena_release();
         if (addr * sizeof(uint32_t) >= s->vga_ram_size) {//s->vram_size) {
             return 0xff;
         }
@@ -2329,6 +2515,8 @@ const static uint8_t vgafont16[256 * 16] = {
 
 static void vga_initmode(VGAState *s)
 {
+    /* The screen clear below walks every dword of the buffer. */
+    njit_vga_arena_release();
     for (int i = 0; i < 64*3; i++)
         s->palette[i] = pal_ega[i];
     s->palette_dirty = 1;
@@ -2362,6 +2550,12 @@ static void vga_initmode(VGAState *s)
         }
     }
 
+    /* The buffer has just been rewritten from the bottom and the new mode may
+     * well be one that cannot reach the top, so put it back on offer.  This is
+     * the mode-set boundary; graphic_mode alone does not change when a game
+     * moves between planar and chain 4. */
+    njit_vga_arena_rearm();
+    njit_vga_write_update(s);
     s->ar_index = 0x20;
 }
 

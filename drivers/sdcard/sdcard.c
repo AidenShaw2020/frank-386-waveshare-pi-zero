@@ -1,4 +1,5 @@
 #include "sdcard.h"
+#include <string.h>
 
 #include "pico.h"
 #include "pico/stdlib.h"
@@ -54,7 +55,21 @@
 #define CT_BLOCK       0x08            /* Block addressing */
 
 #define CLK_SLOW	(100 * KHZ)
-#define CLK_FAST	(30 * MHZ)
+/*
+ * The card clock only pays for the bytes, not for the command, the card's
+ * own read latency or the ready wait - which together were 270 us of the
+ * 407 us a single-sector read used to cost.  It matters much more now that
+ * the read-ahead run above moves eight sectors per command: there the
+ * transfer is most of the time rather than a third of it.
+ *
+ * Override with -DSDCARD_CLK_MHZ=<n>; the rate the PL022 divisor actually
+ * lands on is recorded in g_sd_baud, because it is not the one asked for.
+ */
+#ifndef SDCARD_CLK_MHZ
+#define SDCARD_CLK_MHZ 30
+#endif
+#define CLK_FAST	(SDCARD_CLK_MHZ * MHZ)
+uint32_t g_sd_baud;   /* what the PL022 divisor actually gave us */
 
 static volatile
 DSTATUS Stat = STA_NOINIT;	/* Physical drive status */
@@ -100,7 +115,7 @@ static void FCLK_SLOW(void)
 static void FCLK_FAST(void)
 {
 #ifndef SDCARD_PIO
-    spi_set_baudrate(SDCARD_SPI_BUS, CLK_FAST);
+    g_sd_baud = spi_set_baudrate(SDCARD_SPI_BUS, CLK_FAST);
 #endif
 }
 
@@ -665,6 +680,40 @@ void disk_stall_snapshot(uint32_t *ops, uint32_t *max_us,
 	*stalls   = g_disk_stall_2ms;     g_disk_stall_2ms = 0;
 }
 
+/*
+ * Sequential read-ahead for the guest's disk image.
+ *
+ * ide_sector_read() serves one 512-byte sector per transfer unless the guest
+ * has issued SET MULTIPLE MODE, which DOS through the BIOS does not, so a
+ * game loading eighteen sectors pays eighteen CMD17 round trips.  Measured on
+ * the DRACIHIS intro with the cycle-counter profiler: 15 493 reads in twenty
+ * seconds and 6.311 s inside disk_read - 31.5% of core 0 - at 407 us each, of
+ * which only 137 us is the 512 bytes moving at 30 MHz.  The rest is command,
+ * card latency and the ready wait, and it is paid per read however small.
+ *
+ * So one aligned run of RA_SECTORS is kept, and a single-sector read that
+ * lands inside it is a memcpy.  Guest disk access while loading is
+ * overwhelmingly sequential, which is what makes the extra sectors free
+ * rather than wasted.  A random single-sector read costs one longer transfer
+ * instead of one short one; that is the trade, and the counters below say
+ * which way it went.
+ *
+ * The 4 KB comes from no longer inlining nj_try_execute() at every backward
+ * branch in the interpreter, which returned 8 KB of static SRAM on a board
+ * whose heap had under a kilobyte of headroom.
+ */
+#ifndef SDCARD_READAHEAD
+#define SDCARD_READAHEAD 0
+#endif
+#define RA_SECTORS 8u
+static BYTE ra_buf[RA_SECTORS * 512u];
+static LBA_t ra_first;
+static UINT ra_valid;            /* sectors held; 0 = empty */
+static BYTE ra_drv = 0xff;
+uint32_t g_disk_ra_hits, g_disk_ra_fills, g_disk_ra_bypass;
+
+static void ra_drop(void) { ra_valid = 0; }
+
 DRESULT disk_read (BYTE drv, BYTE *buff, LBA_t sector, UINT count)
 {
 	const uint32_t t_enter = time_us_32();
@@ -674,6 +723,32 @@ DRESULT disk_read (BYTE drv, BYTE *buff, LBA_t sector, UINT count)
 	 * roughly 30x faster than the same blocks over SPI. */
 	if (dc_read((uint32_t)sector, (uint32_t)count, (uint8_t *)buff)) {
 		r = RES_OK;
+	} else if (SDCARD_READAHEAD && count == 1u && ra_valid && drv == ra_drv &&
+		   sector >= ra_first && sector < ra_first + ra_valid) {
+		memcpy(buff, ra_buf + (size_t)(sector - ra_first) * 512u, 512u);
+		g_disk_ra_hits++;
+		r = RES_OK;
+	} else if (SDCARD_READAHEAD && count == 1u) {
+		/* Refill around the miss, aligned so that a sequential run hits
+		 * every time after the first.  A refill that the card refuses -
+		 * the last sectors of the medium, say - falls back to the plain
+		 * single-sector read rather than failing the request. */
+		LBA_t first = sector & ~(LBA_t)(RA_SECTORS - 1u);
+		ra_valid = 0;
+		if (disk_read_impl(drv, ra_buf, first, RA_SECTORS) == RES_OK) {
+			ra_first = first;
+			ra_valid = RA_SECTORS;
+			ra_drv = drv;
+			memcpy(buff, ra_buf + (size_t)(sector - first) * 512u, 512u);
+			g_disk_ra_fills++;
+			r = RES_OK;
+		} else {
+			r = disk_read_impl(drv, buff, sector, count);
+			g_disk_ra_bypass++;
+		}
+		if (r == RES_OK)
+			dc_fill((uint32_t)sector, (uint32_t)count,
+				(const uint8_t *)buff);
 	} else {
 		PROF_T(t_disk);
 		r = disk_read_impl(drv, buff, sector, count);
@@ -704,5 +779,8 @@ DRESULT disk_write (BYTE drv, const BYTE *buff, LBA_t sector, UINT count)
 	/* Write-through: the card is authoritative. Drop the affected blocks
 	 * rather than patching them, since writes need not be aligned. */
 	dc_invalidate((uint32_t)sector, (uint32_t)count);
+	/* Write-through here too: the run is dropped rather than patched, so an
+	 * unaligned or partial write cannot leave it half stale. */
+	ra_drop();
 	return r;
 }

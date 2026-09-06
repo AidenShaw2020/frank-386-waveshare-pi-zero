@@ -80,6 +80,14 @@ static inline void audio_i2s_program_init(PIO pio, uint sm, uint offset, uint da
     sm_config_set_out_pins(&sm_config, data_pin, 1);
     sm_config_set_sideset_pins(&sm_config, clock_pin_base);
     sm_config_set_out_shift(&sm_config, false, true, 32);
+    /* This state machine only transmits, so its RX FIFO is dead weight;
+     * joining it doubles the TX FIFO from four words to eight.  Each word is
+     * one stereo frame, so that is how much audio is already committed to the
+     * hardware when the core that feeds it is busy elsewhere - 181 us instead
+     * of 90.  It is the whole cushion the output has: the DMA carries one
+     * frame, so once the FIFO empties the state machine stalls on its pull
+     * and the frame clock stops until data arrives. */
+    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
 
     pio_sm_init(pio, sm, offset, &sm_config);
 
@@ -97,6 +105,8 @@ static inline void audio_i2s_cs4334_program_init(PIO pio, uint sm, uint offset, 
     sm_config_set_out_pins(&sm_config, data_pin, 1);
     sm_config_set_sideset_pins(&sm_config, clock_pin_base);
     sm_config_set_out_shift(&sm_config, false, true, 32);
+    /* Transmit only; see the note in audio_i2s_program_init. */
+    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
 
     pio_sm_init(pio, sm, offset, &sm_config);
 

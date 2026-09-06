@@ -145,6 +145,11 @@ struct VGAState {
     
     /* text mode state */
     uint32_t last_palette[16];
+    /* When the current scanline's horizontal blanking ends, in get_uticks()
+     * microseconds.  Written by the display ISR once per line so that the
+     * Display Enable bit of port 0x3DA is in phase with the real scanout;
+     * see the 0x3BA/0x3DA case in vga_ioport_read(). */
+    uint32_t hblank_until;
 #ifndef FULL_UPDATE
     uint16_t last_ch_attr[MAX_TEXT_WIDTH * MAX_TEXT_HEIGHT];
 #endif
@@ -171,6 +176,13 @@ struct VGAState {
 };
 
 uint32_t get_uticks();
+
+/* Horizontal blanking, in microseconds: 160 of the 800 pixel times of a
+ * 640x480x60 line, which is 6.4 us of its 31.75 us. */
+#define VGA_HBLANK_US   6u
+/* How stale hblank_until may get before the read path stops trusting it and
+ * falls back to a free-running phase: about thirty scanlines. */
+#define VGA_HBLANK_STALE_US 1000u
 
 
 #endif /* VGA_H */

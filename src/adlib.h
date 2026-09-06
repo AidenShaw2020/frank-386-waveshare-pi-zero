@@ -120,6 +120,13 @@ int16_t adlib_getsample(AdlibState *s);
 // call it from main cycle on core0
 void adlib_core0(AdlibState *s);
 
+/* See FRANK_ADLIB_CORE1 in adlib.c: synthesise on core 1, in the gap where it
+ * would otherwise spin waiting for the I2S DMA of a single frame. */
+#ifndef ADLIB_CORE1
+#define ADLIB_CORE1 0
+#endif
+void adlib_pump(AdlibState *s);
+
 /* Render forward until the ring is ADLIB_LEAD_SAMPLES ahead of core 1, but
  * only if at least min_samples are owed.  Core 0 only.  adlib_write() passes
  * 1 so a register write takes effect between samples rather than
