@@ -51,6 +51,11 @@ void i2s_init(i2s_config_t *i2s_config);
 void i2s_write(const i2s_config_t *i2s_config, const int16_t *samples, const size_t len);
 void i2s_dma_write(i2s_config_t *i2s_config, const int16_t *samples);
 void i2s_volume(i2s_config_t *i2s_config, uint8_t volume);
+/* Run one small unit of work per call while a frame is in flight.
+ * See i2s_set_idle_hook() in audio.c for why a batch is not safe. */
+void i2s_set_idle_hook(void (*fn)(void));
+/* Ring build only: run the idle hook once, there being no wait to hide it in. */
+void i2s_idle_run(void);
 void i2s_increase_volume(i2s_config_t *i2s_config);
 void i2s_decrease_volume(i2s_config_t *i2s_config);
 

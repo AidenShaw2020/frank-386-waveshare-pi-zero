@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "adlib.h"
+#include "njit_timeprof.h"
 #include "audiodiag.h"
 #include "emu8950/emu8950.h"
 #if defined(RP2350_BUILD)
@@ -144,6 +145,51 @@ static inline int16_t adlib_sat16(int32_t v)
     return (int16_t)v;
 }
 
+/*
+ * FRANK_ADLIB_CORE1 - OPL synthesis on core 1.
+ *
+ * Core 1 spends its life in i2s_dma_write() waiting for the DMA of a single
+ * stereo frame: measured on Tyrian 2000, 44 102 loop iterations a second and
+ * 94.5% of the core inside that wait.  Core 0 meanwhile pays 10.8% of itself
+ * for the periodic OPL refill, and a build with the refill simply deleted
+ * runs the guest 11.6% faster.
+ *
+ * A note in audio.c says an earlier attempt to move this to a core-1 alarm
+ * pool "recovered none of that", and attributes the cost to the XIP cache
+ * both cores share rather than to core-0 cycles.  The cycle counter
+ * disagrees: with the refill core 0 spends 209 cycles per guest instruction
+ * and without it 210, so the OPL's cache footprint costs the interpreter
+ * nothing measurable and the 10.8% really is just time.
+ *
+ * What has to cross cores is only the guest's register writes.  The sample
+ * ring was already single-producer/single-consumer, and moving production to
+ * the consumer's core removes that sharing rather than adding to it.  The
+ * queue is static rather than a member of AdlibState because that struct is
+ * malloc'd and pc_new() has under a kilobyte of heap headroom.
+ */
+#define ADLIB_CMD_SLOTS 128u            /* 2.9 ms of backlog at 44.1 kHz */
+static uint32_t adlib_cmd[ADLIB_CMD_SLOTS];
+static volatile uint32_t adlib_cmd_w;   /* written by core 0 */
+static volatile uint32_t adlib_cmd_r;   /* written by core 1 */
+uint32_t g_adlib_cmd_full;              /* queue overflowed: audio may glitch */
+uint32_t g_adlib_underrun_total;        /* ring ran dry: an audible gap */
+
+static inline void adlib_cmd_push(unsigned bank, unsigned reg, unsigned val)
+{
+    uint32_t w = adlib_cmd_w;
+    /* Bounded wait.  Dropping a register write corrupts an instrument for as
+     * long as the note lasts, so waiting is right; giving up eventually is
+     * only there so a stalled core 1 cannot hang the guest. */
+    for (unsigned spin = 0; w - adlib_cmd_r >= ADLIB_CMD_SLOTS; ++spin) {
+        if (spin > 100000u) { g_adlib_cmd_full++; return; }
+        __dmb();
+    }
+    adlib_cmd[w & (ADLIB_CMD_SLOTS - 1u)] =
+        ((uint32_t)bank << 16) | ((uint32_t)(reg & 0xffu) << 8) | (val & 0xffu);
+    __dmb();                            /* the entry lands before the index */
+    adlib_cmd_w = w + 1u;
+}
+
 void adlib_write(void *opaque, uint32_t nport, uint32_t val)
 {
     AdlibState *s = opaque;
@@ -152,7 +198,11 @@ void adlib_write(void *opaque, uint32_t nport, uint32_t val)
      * write applies from the next sample on rather than retroactively to
      * everything core 1 has not played yet.  One sample of backlog is worth
      * rendering here - this is the whole point of the exercise. */
-    adlib_produce(s, 1);
+    if (!ADLIB_CORE1) {
+        NJT_T(njt_oplw);
+        adlib_produce(s, 1);
+        NJT_ADD(njt_oplw, NJT_OPLW);
+    }
     /*
      * The OPL is reachable at three port pairs, not one:
      *
@@ -193,7 +243,8 @@ void adlib_write(void *opaque, uint32_t nport, uint32_t val)
                      * instances cannot represent.  Every ordinary bank-1
                      * voice/operator register maps directly to the second
                      * nine-channel OPL2. */
-                    OPL_writeReg(g_opl3_bank1, reg, val);
+                    if (ADLIB_CORE1) adlib_cmd_push(1u, reg, val);
+                    else OPL_writeReg(g_opl3_bank1, reg, val);
                 }
             }
             return;
@@ -218,7 +269,8 @@ void adlib_write(void *opaque, uint32_t nport, uint32_t val)
                     s->adlibstatus = 0;
                     s->adlibregmem[4] = 0;
                 }
-                OPL_writeReg(s->opl, reg, val);
+                if (ADLIB_CORE1) adlib_cmd_push(0u, reg, val);
+                else OPL_writeReg(s->opl, reg, val);
             }
     }
 }
@@ -287,6 +339,10 @@ int16_t __not_in_flash_func(adlib_getsample)(AdlibState *s) {
          * snapping that to silence and back is a click far louder than the
          * gap it fills. */
         s->underrun_count++;
+        /* Free-running mirror: adlib_underruns() clears the member when the
+         * stats dump reads it, which makes it useless for a windowed
+         * measurement from the host. */
+        g_adlib_underrun_total++;
         return s->last;
     }
 
@@ -347,11 +403,25 @@ void adlib_gap_snapshot(uint32_t *calls, uint32_t *max_us,
  * whole-batch rendering gave every sample in 1.45 ms of audio the same
  * register snapshot, which decimated an 8.5 kHz stream to about 690 Hz.
  */
-void __not_in_flash_func(adlib_produce)(AdlibState *s, uint32_t min_samples) {
+/*
+ * max_samples exists because of where this now runs.
+ *
+ * On core 0 a long burst was free: core 1 was feeding the I2S DMA and did not
+ * care how long the producer took.  On core 1 the same core does both, and
+ * the DMA carries a single stereo frame - 22.7 us - so any render longer than
+ * that leaves the I2S with nothing to send.  Rendering the whole lead in one
+ * call is ten times that, which is what made the digital channel distort and
+ * the FM drop out.  Eight samples is about 8 us of work and, called once per
+ * output frame, still has eight times the throughput the chip needs.
+ */
+static void __not_in_flash_func(adlib_produce_n)(AdlibState *s,
+                                                 uint32_t min_samples,
+                                                 uint32_t max_samples) {
     if (!s->opl) return;
 
     int32_t n = (int32_t)(s->rpos + ADLIB_LEAD_SAMPLES - s->wpos);
     if (n < (int32_t)min_samples) return;
+    if ((uint32_t)n > max_samples) n = (int32_t)max_samples;
 
     const int use_bank1 = g_opl3_bank1 &&
                           (s->adlibregmem[0] & ADLIB_OPL3_ENABLED);
@@ -437,6 +507,66 @@ void __not_in_flash_func(adlib_core0)(AdlibState *s) {
 
     adlib_produce(s, ADLIB_PERIODIC_MIN);
     g_adlib_us_total += time_us_32() - t_enter;
+}
+
+/*
+ * Core 1: apply what the guest has written, then render one sample.
+ *
+ * This is the I2S idle hook, so it is called repeatedly *inside* the wait for
+ * the frame in flight and the caller re-checks the DMA between calls.  That
+ * is what makes it safe to synthesise here at all, and it dictates the shape:
+ * one small unit per call, never a batch.
+ *
+ * The first version ran once per frame after the transfer had been started
+ * and rendered up to eight samples.  Nothing could then hand the output back
+ * early, and 13.8% of frames were restarted after the DMA had already
+ * drained - the PIO stalls with no data, so the frame clock stretches and the
+ * output picks up sample-rate jitter.  Every OPL counter reads zero through
+ * all of it: the ring had the sample, it just did not reach the DAC on time.
+ * `g_i2s_late` in audio.c is the counter that does see it.
+ *
+ * The queue drain is bounded for the same reason.  A guest that writes a
+ * whole instrument at once would otherwise put a hundred OPL_writeReg calls
+ * in one unit; the hook runs many times per frame, so a bound of eight still
+ * applies every write inside the frame it arrived in, and register order is
+ * preserved because the render follows the drain in the same call.
+ */
+/*
+ * One sample per call, and it must stay one.
+ *
+ * Two was tried when a faster guest started running the ring dry - 9157
+ * underruns in fifteen seconds of DRACIHIS against none before.  It fixed the
+ * underruns and broke the sound in a different way: the user described it as
+ * "a badly tuned FM radio".  That is the register-0x40 sample playback this
+ * file's producer comment already describes.  Rendering two samples per call
+ * applies the guest's register writes at two-sample granularity, which halves
+ * the effective rate of a digitised stream - exactly the decimation the
+ * one-sample producer exists to avoid.
+ *
+ * So the ring running dry is not fixable here.  It means core 1 no longer has
+ * the time, and the answer is the structural one this project keeps deferring:
+ * an I2S DMA that carries more than a single frame, so core 1 is not required
+ * every 22.7 microseconds.  Until then the guest cannot get much faster
+ * without the audio paying for it.
+ */
+#define ADLIB_PUMP_SAMPLES 1u
+#define ADLIB_PUMP_CMDS    8u
+void __not_in_flash_func(adlib_pump)(AdlibState *s) {
+    uint32_t r = adlib_cmd_r;
+    for (unsigned i = 0; i < ADLIB_PUMP_CMDS && r != adlib_cmd_w; ++i) {
+        uint32_t c = adlib_cmd[r & (ADLIB_CMD_SLOTS - 1u)];
+        OPL *opl = (c >> 16) ? g_opl3_bank1 : s->opl;
+        if (opl) OPL_writeReg(opl, (uint8_t)(c >> 8), (uint8_t)c);
+        r++;
+    }
+    __dmb();
+    adlib_cmd_r = r;
+
+    adlib_produce_n(s, 1u, ADLIB_PUMP_SAMPLES);
+}
+
+void __not_in_flash_func(adlib_produce)(AdlibState *s, uint32_t min_samples) {
+    adlib_produce_n(s, min_samples, 0xffffffffu);
 }
 
 uint32_t adlib_underruns(AdlibState *s) {

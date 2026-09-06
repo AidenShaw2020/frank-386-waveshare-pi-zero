@@ -35,6 +35,10 @@
 #include <hardware/clocks.h>
 #endif
 
+#ifndef I2S_RING_FRAMES
+#define I2S_RING_FRAMES 0
+#endif
+
 static uint8_t volume = 0; // 0 - MAX vol, 16 - silece (for i2s, for pwm - 12)
 
 #ifdef FEATURE_AUDIO_I2S
@@ -60,6 +64,38 @@ i2s_config_t i2s_get_default_config(void) {
  * Initialize the I2S driver. Must be called before calling i2s_write or i2s_dma_write
  * i2s_config: I2S context obtained by i2s_get_default_config()
  */
+#if FEATURE_AUDIO_I2S && I2S_RING_FRAMES
+/*
+ * A free-running ring instead of one frame at a time.
+ *
+ * The single-frame DMA is why core 1 has to come back every 22.7 us, and that
+ * deadline is what has capped this machine: the OPL gets a fraction of a frame
+ * to work in, and when the guest got faster the ring ran dry - 9157 underruns
+ * in fifteen seconds - which is heard as distortion, not as a gap.  Every
+ * workaround for it has been tried; this removes the deadline instead.
+ *
+ * The DMA reads I2S_RING_FRAMES words with the read address in ring mode and
+ * the channel chained to itself, so it plays the buffer round and round with
+ * no software service at all.  The timer ISR writes into it directly.
+ *
+ * What the old design got for free and this has to do explicitly: the 44.1 kHz
+ * timer and the PIO's divided bit clock are different clocks.  Copying
+ * whatever `samples` held at each DMA completion hid that - it duplicated or
+ * dropped a frame as needed, which is why the frame rate read 44 440 against
+ * 44 100 interrupts.  Here the two pointers would drift apart until the writer
+ * laps the reader, so the ISR measures its lead over the DMA's read address
+ * and drops or repeats one frame to hold it near half the ring.
+ */
+_Static_assert((I2S_RING_FRAMES & (I2S_RING_FRAMES - 1)) == 0,
+               "the ring index masks and the DMA ring size need a power of two");
+static uint32_t i2s_ring[I2S_RING_FRAMES]
+    __attribute__((aligned(I2S_RING_FRAMES * 4)));
+static uint32_t i2s_write_idx;
+uint32_t g_i2s_ring_skips;     /* frames dropped to stop the writer lapping */
+uint32_t g_i2s_ring_dups;      /* frames repeated to stop it falling behind */
+static int i2s_ring_chan_b = -1;   /* the other half of the hand-off pair */
+#endif
+
 void i2s_init(i2s_config_t *i2s_config) {
     uint8_t func;
     if      (i2s_config->pio == pio0) func = GPIO_FUNC_PIO0;
@@ -107,6 +143,34 @@ void i2s_init(i2s_config_t *i2s_config) {
 
     volatile uint32_t *addr_write_DMA = &(i2s_config->pio->txf[i2s_config->sm]);
     channel_config_set_dreq(&dma_config, pio_get_dreq(i2s_config->pio, i2s_config->sm, true));
+#if I2S_RING_FRAMES
+    /*
+     * Two channels handing off to each other, each playing the whole ring.
+     *
+     * A single channel chained to itself does not work and the reason is easy
+     * to miss: CHAIN_TO pointing at the channel's own number is the documented
+     * way to *disable* chaining.  Tried first, and the symptom was clear once
+     * the counters were there - the writer skipped 1 173 740 frames in a
+     * couple of minutes because the reader had stopped after one pass.
+     *
+     * Ring mode wraps each channel's read address inside the aligned buffer,
+     * so a full pass ends back at the start and either channel can take over
+     * from the other with the same initial address.
+     */
+    i2s_ring_chan_b = dma_claim_unused_channel(true);
+    channel_config_set_ring(&dma_config, false, __builtin_ctz(I2S_RING_FRAMES * 4u));
+
+    dma_channel_config cfg_b = dma_config;
+    channel_config_set_chain_to(&dma_config, i2s_ring_chan_b);
+    channel_config_set_chain_to(&cfg_b, i2s_config->dma_channel);
+
+    dma_channel_configure(i2s_config->dma_channel, &dma_config,
+                          addr_write_DMA, i2s_ring, I2S_RING_FRAMES, false);
+    dma_channel_configure(i2s_ring_chan_b, &cfg_b,
+                          addr_write_DMA, i2s_ring, I2S_RING_FRAMES, false);
+    pio_sm_set_enabled(i2s_config->pio, i2s_config->sm, true);
+    dma_channel_start(i2s_config->dma_channel);
+#else
     dma_channel_configure(i2s_config->dma_channel,
                           &dma_config,
                           addr_write_DMA,    // Destination pointer
@@ -115,6 +179,7 @@ void i2s_init(i2s_config_t *i2s_config) {
                           false                                       // Start immediately
     );
     pio_sm_set_enabled(i2s_config->pio, i2s_config->sm, true);
+#endif
 }
 
 /**
@@ -136,9 +201,130 @@ void i2s_write(const i2s_config_t *i2s_config, const int16_t *samples, const siz
  * i2s_config: I2S context obtained by i2s_get_default_config()
  *     sample: pointer to an array of dma_trans_count x 32 bits samples
  */
+/*
+ * Did the output ever run dry?
+ *
+ * The DMA carries a single stereo frame, so the only thing keeping the I2S
+ * fed is this function being called again before the frame has finished.
+ * Nothing measured that.  The ring-underrun and command-queue counters both
+ * sit inside the OPL and cannot see it: they say a sample was available, not
+ * that it reached the DAC on time.  A late call stalls the PIO - the frame
+ * clock stops until data arrives - which is sample-rate jitter, i.e. exactly
+ * the kind of fault that is audible but leaves every existing counter at
+ * zero.
+ *
+ * `g_i2s_late` counts the frames where the transfer had already finished by
+ * the time we asked, and `g_i2s_wait_us` accumulates how long the wait
+ * actually blocked, so the two together say both how often and how badly.
+ */
+uint32_t g_i2s_frames;
+uint32_t g_i2s_late;
+uint32_t g_i2s_wait_us;
+uint32_t g_i2s_late_us;         /* worst single overrun seen, microseconds */
+static uint32_t i2s_last_start_us;
+
+/*
+ * The one counter that is not a proxy.
+ *
+ * `g_i2s_late` above says the DMA had already finished when we came back,
+ * which is a warning and not a fault: the transfer completes as soon as the
+ * PIO's TX FIFO accepts the word, so an idle channel only means the FIFO had
+ * room.  The output is not damaged until the FIFO runs *empty*, and the PIO
+ * records exactly that - FDEBUG_TXSTALL latches when the state machine
+ * executes a pull with nothing to pull, which stops the frame clock until
+ * data arrives.  That stall is the crackle.
+ *
+ * The bit is sticky and cleared by writing one back, so counting the frames
+ * in which it was found set gives the rate directly.
+ */
+uint32_t g_i2s_txstall;
+
+/*
+ * Work to do while the frame is in flight.
+ *
+ * The wait below is where core 1 spends almost all of its time, and giving it
+ * something to do there is the only safe place to put work on this core: the
+ * loop re-checks the DMA between units, so it hands the output back the
+ * instant the frame ends instead of finishing a unit first.  Anything called
+ * from the caller's loop *after* the transfer is started has no such
+ * guarantee - it runs to completion and the restart waits for it, which is
+ * what stalled 13.8% of frames when the OPL was pumped that way.
+ *
+ * The hook must therefore do one small unit per call, not a batch.
+ */
+static void (*i2s_idle_hook)(void);
+
+/* Longest a single unit of hook work may take, rounded up.  One OPL sample
+ * measures about three microseconds on this board at 504 MHz. */
+#define I2S_IDLE_MARGIN_US 5u
+
+void i2s_set_idle_hook(void (*fn)(void)) { i2s_idle_hook = fn; }
+
+/* The ring build has no wait to hide work inside, so core 1 calls this. */
+void __not_in_flash_func(i2s_idle_run)(void)
+{
+    if (i2s_idle_hook) i2s_idle_hook();
+}
+
 void __not_in_flash_func(i2s_dma_write)(i2s_config_t *i2s_config, const int16_t *samples) {
+    const uint32_t t_enter = time_us_32();
+    g_i2s_frames++;
+    {
+        const uint32_t stall = 1u << (PIO_FDEBUG_TXSTALL_LSB + i2s_config->sm);
+        if (i2s_config->pio->fdebug & stall) {
+            g_i2s_txstall++;
+            i2s_config->pio->fdebug = stall;   /* write one to clear */
+        }
+    }
+    if (!dma_channel_is_busy(i2s_config->dma_channel)) {
+        /* The frame drained while we were elsewhere.  How long the output had
+         * nothing to send is this call's arrival minus the frame period after
+         * the previous start; the first frame after boot has no predecessor
+         * and is simply not counted as late. */
+        if (i2s_last_start_us) {
+            g_i2s_late++;
+            /* Unsigned, so a call that arrives before the recorded start -
+             * the timer is read after the DMA is launched, and an interrupt
+             * between the two inverts the order - wrapped to four billion and
+             * pinned the high-water mark there. */
+            const int32_t d = (int32_t)(t_enter - i2s_last_start_us);
+            const uint32_t elapsed = d > 0 ? (uint32_t)d : 0u;
+            /* One stereo frame at the configured rate, in microseconds. */
+            const uint32_t period = 1000000u / 44100u;
+            const uint32_t over = elapsed > period ? elapsed - period : 0u;
+            if (over > g_i2s_late_us) g_i2s_late_us = over;
+        }
+    }
     /* Wait the completion of the previous DMA transfer */
-    dma_channel_wait_for_finish_blocking(i2s_config->dma_channel);
+    if (i2s_idle_hook) {
+        /*
+         * Stop handing out work near the end of the frame.
+         *
+         * The DMA is re-checked between units, but a unit that has already
+         * started still has to finish, so the frame can still be restarted
+         * one unit late.  Rendering an OPL sample is about three
+         * microseconds and that residue was 2.3% of frames; refusing to
+         * begin another one in the last few microseconds removes it.  The
+         * hook only has to produce one sample per frame and the wait is
+         * seventeen microseconds long, so there is no shortage of chances.
+         */
+        const uint32_t budget = i2s_last_start_us +
+                                (1000000u / i2s_config->sample_freq) -
+                                I2S_IDLE_MARGIN_US;
+        /* The clock is read once per unit of work, not once per turn of the
+         * spin: time_us_32() goes out over APB and this loop turns hundreds
+         * of times a frame, which is bus traffic core 0 pays for. */
+        int allow = 1;
+        while (dma_channel_is_busy(i2s_config->dma_channel)) {
+            if (allow) {
+                i2s_idle_hook();
+                allow = (int32_t)(budget - time_us_32()) > 0;
+            }
+        }
+    } else {
+        dma_channel_wait_for_finish_blocking(i2s_config->dma_channel);
+    }
+    g_i2s_wait_us += time_us_32() - t_enter;
     /* Copy samples into the DMA buffer */
     for (int i = 0; i < i2s_config->dma_trans_count * 2; ++i) {
         i2s_config->dma_buf[i] = samples[i] >> volume;
@@ -147,6 +333,7 @@ void __not_in_flash_func(i2s_dma_write)(i2s_config_t *i2s_config, const int16_t 
     dma_channel_transfer_from_buffer_now(i2s_config->dma_channel,
                                          i2s_config->dma_buf,
                                          i2s_config->dma_trans_count);
+    i2s_last_start_us = time_us_32();
 }
 
 /**
@@ -250,6 +437,34 @@ void audio_init(void) {
 }
 
 static int16_t samples[2] = { 0 };
+
+#if FEATURE_AUDIO_I2S && I2S_RING_FRAMES
+static inline void i2s_ring_put(int16_t l, int16_t r)
+{
+    const uint32_t word = ((uint32_t)(uint16_t)(r >> volume) << 16) |
+                          (uint32_t)(uint16_t)(l >> volume);
+    const uint32_t mask = I2S_RING_FRAMES - 1u;
+    const int ch = dma_channel_is_busy(i2s_config.dma_channel)
+                 ? i2s_config.dma_channel : i2s_ring_chan_b;
+    uint32_t read_idx =
+        (uint32_t)((dma_hw->ch[ch].read_addr - (uintptr_t)i2s_ring) >> 2) & mask;
+    uint32_t lead = (i2s_write_idx - read_idx) & mask;
+
+    i2s_ring[i2s_write_idx & mask] = word;
+    i2s_write_idx++;
+
+    /* Hold the lead near half a ring.  One frame either way per interrupt is
+     * enough: the two clocks differ by well under a percent. */
+    if (lead > (I2S_RING_FRAMES / 2u) + (I2S_RING_FRAMES / 8u)) {
+        i2s_write_idx--;                    /* too far ahead: drop this one */
+        g_i2s_ring_skips++;
+    } else if (lead < (I2S_RING_FRAMES / 2u) - (I2S_RING_FRAMES / 8u)) {
+        i2s_ring[i2s_write_idx & mask] = word;   /* falling behind: repeat */
+        i2s_write_idx++;
+        g_i2s_ring_dups++;
+    }
+}
+#endif
 
 //=============================================================================
 // Core 1 Entry Point (Audio processing)
@@ -357,6 +572,9 @@ bool __not_in_flash_func(timer_callback)(repeating_timer_t *rt) {
          * WS=1 (right); little-endian, that is dma_buf[0] = left. */
         samples[0] = l_v;
         samples[1] = r_v;
+        #if I2S_RING_FRAMES
+            i2s_ring_put((int16_t)l_v, (int16_t)r_v);
+        #endif
     #endif
     return true;
 }
@@ -364,6 +582,15 @@ bool __not_in_flash_func(timer_callback)(repeating_timer_t *rt) {
 // to call DMA-wait not from ISR for timer
 bool __not_in_flash_func(repeat_me_often)(void) {
     #if FEATURE_AUDIO_I2S
+    #if I2S_RING_FRAMES
+        /*
+         * Nothing to service: the DMA feeds itself from the ring.  The idle
+         * hook still has to run, and now it runs with no deadline in front of
+         * it at all, which is the entire point of the change.
+         */
+        i2s_idle_run();
+    #else
         i2s_dma_write(&i2s_config, samples);
+    #endif
     #endif
 }

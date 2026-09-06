@@ -102,6 +102,44 @@ Four GPIO layouts are supported: **M1**, **M2**, **PC** (Olimex), and **Z2** (Wa
 
 ## SD Card Setup
 
+### Format the card exFAT — this is a performance requirement, not a preference
+
+Format the card **exFAT**, or FAT32 with a **32–64 KB cluster**. A FAT32 card
+with a small (4–8 KB) cluster costs about a quarter of the emulator's CPU
+time, and it is audible: the music and the animation start waiting for each
+other.
+
+The emulator serves the guest one 512-byte sector per IDE transfer, because
+DOS through the BIOS never issues SET MULTIPLE MODE, and every one of those
+becomes a FatFS read of the disk image. The smaller the cluster, the more of
+those reads land on the FAT itself rather than on the file, and each costs a
+full SPI command round trip whatever its size.
+
+Measured on the same board, the same firmware and the same twenty seconds of
+the Draci historie intro — the only difference is how the card was formatted:
+
+| | FAT32, small cluster | exFAT |
+|---|---:|---:|
+| SD reads | 12 630 | **1 040** |
+| time inside `disk_read` | 5.15 s — 25.6% of core 0 | **0.49 s — 2.4%** |
+| audio ring underruns | 16 | **0** |
+| silence no buffer could hide | 4 925 ms | **0 ms** |
+| guest MIPS | 1.658 | 1.737 |
+
+If the emulator feels slow and the sound breaks up in a way it did not
+before, check the card's cluster size first:
+
+```powershell
+Get-CimInstance Win32_Volume | Select-Object DriveLetter, FileSystem, BlockSize
+```
+
+`BlockSize` is the cluster size in bytes. Reformatting erases the card, so
+back it up first:
+
+```
+format X: /FS:exFAT /Q
+```
+
 ### Directory Structure
 
 Create a `386/` directory on your SD card:
