@@ -1,4 +1,14 @@
+/* Measurement build only: skip the periodic OPL refill so the ceiling of
+ * moving it off core 0 can be read directly.  Audio is silent with this on;
+ * never ship it. */
+#ifndef FRANK_NO_ADLIB
+#define FRANK_NO_ADLIB 0
+#endif
+
 #include "pc.h"
+#include "njit_timeprof.h"
+volatile uint64_t g_njt[NJT_COUNT];
+#include "njit_vga_arena.h"
 #include "audiodiag.h"
 #include "ide.h"
 #include "dss.h"
@@ -815,6 +825,9 @@ void pc_vga_step(void *o)
 
 void __not_in_flash_func(pc_step)(PC *pc)
 {
+	njt_arm();
+	NJT_COUNT_ONE(NJT_CALLS);
+	NJT_T(njt_total);
 	PROF_T(t_total);
 	PROF_T(t_dev);
 	FRANK_PROF_T(ft_total);
@@ -910,7 +923,23 @@ void __not_in_flash_func(pc_step)(PC *pc)
 	const int pit_subdiv = pit_reload < 512 ? 4 : 1;
 	const int pit_chunk = 256 / pit_subdiv;
 
-	if (pc->adlib_enabled) {
+	/*
+	 * ADLIB_CORE1 takes the no-AdLib branch, and that is a performance fix,
+	 * not tidying.
+	 *
+	 * The interleaved loop below exists to refill the OPL sixteen times per
+	 * pc_step().  With the synthesis on core 1 its body is compiled out and
+	 * the loop does nothing but chop the interpreter into 256-instruction
+	 * calls - and cpu_exec1's remaining budget is exactly what
+	 * NJ_HOT_BACKEDGE hands the JIT, so every native chain was being capped
+	 * at 256 guest instructions.  Measured: 191 retired per entry, and 71%
+	 * of chains ended because the budget left could not fit the next block.
+	 *
+	 * The branch taken instead is the same one a build with no AdLib takes,
+	 * including its fast-PIT handling, so interrupt cadence is unchanged;
+	 * only the ordinary case collapses back to one 4096-instruction call.
+	 */
+	if (pc->adlib_enabled && !ADLIB_CORE1) {
 		/*
 		 * The OPL2 stream is produced here, interleaved with the
 		 * interpreter, because core 1 has no room for it. Timing the
@@ -943,7 +972,9 @@ void __not_in_flash_func(pc_step)(PC *pc)
 			PROF_T(t_cpu);
 			FRANK_PROF_T(ft_cpu);
 			for (int j = 0; j < pit_subdiv; ++j) {
+				NJT_T(njt_cpu);
 				cpui386_step(pc->cpu, pit_chunk);
+				NJT_ADD(njt_cpu, NJT_CPU);
 				if (pit_subdiv > 1)
 					i8254_update_irq(pc->pit);
 			}
@@ -951,7 +982,13 @@ void __not_in_flash_func(pc_step)(PC *pc)
 			FRANK_PROF_ADD(ft_cpu, prof_cpu);
 			PROF_T(t_adlib);
 			FRANK_PROF_T(ft_adlib);
-			adlib_core0(pc->adlib);
+			{
+				NJT_T(njt_adlib);
+#if !FRANK_NO_ADLIB && !ADLIB_CORE1
+				adlib_core0(pc->adlib);
+#endif
+				NJT_ADD(njt_adlib, NJT_ADLIB);
+			}
 			PROF_ADD(t_adlib, adlib);
 			FRANK_PROF_ADD(ft_adlib, prof_adlib);
 			/*
@@ -1021,6 +1058,7 @@ void __not_in_flash_func(pc_step)(PC *pc)
 	cpui386_step(pc->cpu, 10240);
 #endif
 #endif
+	NJT_ADD(njt_total, NJT_TOTAL);
 	FRANK_PROF_ADD(ft_total, prof_total);
 	FRANK_DIAG_COUNT(prof_steps);
 #if SUBSYS_PROFILE
@@ -1081,6 +1119,7 @@ static u8 iomem_read8(void *iomem, uword addr)
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
+		if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
 		if (addr < pc->vga_mem_size)
 			return pc->vga_mem[addr];
 		else
@@ -1095,6 +1134,7 @@ static void iomem_write8(void *iomem, uword addr, u8 val)
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
+		if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
 		if (addr < pc->vga_mem_size)
 			pc->vga_mem[addr] = val;
 		return;
@@ -1115,6 +1155,7 @@ static void iomem_write16(void *iomem, uword addr, u16 val)
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
+		if (addr + 1 >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
 		if (addr + 1 < pc->vga_mem_size)
 			*(uint16_t *)&(pc->vga_mem[addr]) = val;
 		return;
@@ -1136,6 +1177,7 @@ static void iomem_write32(void *iomem, uword addr, u32 val)
 	if (addr >= vga_addr2) {
 		uword vga_addr2 = pc->pci_vga_ram_addr;
 		addr -= vga_addr2;
+		if (addr + 3 >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
 		if (addr + 3 < pc->vga_mem_size)
 			*(uint32_t *)&(pc->vga_mem[addr]) = val;
 		return;
@@ -1151,6 +1193,7 @@ static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
 	if (addr >= vga_addr2) {
 		uword vga_addr2 = pc->pci_vga_ram_addr;
 		addr -= vga_addr2;
+		if (addr + (uword)len >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
 		if (addr + len < pc->vga_mem_size) {
 			memcpy(pc->vga_mem + addr, buf, len);
 			return true;
@@ -1349,7 +1392,15 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 #endif
 	pc->vga_mem_size = (uword)EMU_VGA_MEM_SIZE_KB << 10;
 	pc->vga_mem = gfx_buffer;
+	/* Hand the region back before the clear below walks over it. */
+	njit_vga_arena_release();
 	memset(pc->vga_mem, 0, pc->vga_mem_size);
+	/* Nothing but the planar path and the linear aperture can reach the top
+	 * of this buffer, and both are hooked, so lend it to the JIT.  See
+	 * njit_vga_arena.h. */
+	if (pc->vga_mem_size >= NJ_VGA_ARENA_OFF + NJ_VGA_ARENA_LEN)
+		njit_vga_arena_offer(pc->vga_mem + NJ_VGA_ARENA_OFF,
+				     NJ_VGA_ARENA_LEN);
 	pc->vga = vga_init(pc->vga_mem, pc->vga_mem_size,
 			   fb, conf->width, conf->height);
 	vga_set_force_8dm(pc->vga, conf->vga_force_8dm);

@@ -8,6 +8,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "adlib.h"
+#include "njit_timeprof.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -873,7 +875,7 @@ extern volatile uint32_t g_njit_rej_op_count[8];
  * spelled out here so a mismatch with NJBP_COUNT/NJCH_COUNT is a build error
  * rather than a silently truncated record. */
 #define NJBP_SLOTS 16
-#define NJCH_SLOTS 13
+#define NJCH_SLOTS 14
 extern volatile uint32_t g_njit_bp[NJBP_SLOTS];
 extern volatile uint32_t g_njit_ch[NJCH_SLOTS];
 extern volatile uint32_t g_wl_tlb_refills;
@@ -1870,6 +1872,23 @@ static void configure_clocks(void) {
 
     // Set system clock
     set_sys_clock_khz(CPU_CLOCK_MHZ * 1000, false);
+
+#if PERI_CLOCK_MHZ
+    /*
+     * The SDK parks clk_peri on the 48 MHz USB clock whenever the system
+     * clock is reconfigured, and the PL022 divides that by an even number -
+     * so the SD card's "30 MHz" was really 24 MHz, and asking for 40 changed
+     * nothing at all.  Source clk_peri from the system PLL instead; the SD
+     * clock is then whatever SDCARD_CLK_MHZ asks for, up to half of this.
+     *
+     * clk_peri feeds the UART as well, which is why this sits before
+     * console_reclock() rather than after it.
+     */
+    clock_configure(clk_peri, 0,
+                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                    (uint32_t)CPU_CLOCK_MHZ * 1000000u,
+                    (uint32_t)PERI_CLOCK_MHZ * 1000000u);
+#endif
     console_reclock();
 
     DBG_PRINT("System clock: %lu MHz\n", clock_get_hz(clk_sys) / 1000000);
@@ -2280,6 +2299,16 @@ static bool __not_in_flash_func(timer_callback0)(repeating_timer_t *rt) {
 }
 // to call DMA wait not from ISR for timer
 bool repeat_me_often(void);
+#if ADLIB_CORE1
+/* The hook takes no argument, so the PC has to reach it some other way; core 1
+ * installs it after pc is live and nothing ever changes it again. */
+static PC *g_adlib_pump_pc;
+static void __not_in_flash_func(adlib_pump_idle)(void) {
+    PC *pc = g_adlib_pump_pc;
+    if (pc && pc->adlib_enabled && pc->adlib) adlib_pump(pc->adlib);
+}
+#endif
+
 static void __not_in_flash_func(core1_entry)(void) {
 
     DBG_PRINT("[Core 1] Initializing video...\n");
@@ -2311,8 +2340,19 @@ static void __not_in_flash_func(core1_entry)(void) {
     static repeating_timer_t m_timer = { 0 };
     int hz = 44100;
     add_repeating_timer_us(-1000000 / hz, timer_callback0, pc, &m_timer);
+    njt_arm();          /* core 1 has its own cycle counter */
+#if ADLIB_CORE1
+    g_adlib_pump_pc = pc;
+    /* Inside the DMA wait, not after it: the wait re-checks the transfer
+     * between calls, so the frame is restarted the moment it ends rather
+     * than after a whole batch of synthesis has finished. */
+    i2s_set_idle_hook(adlib_pump_idle);
+#endif
     while(1) {
+        NJT_T(njt_c1);
         repeat_me_often();
+        NJT_ADD(njt_c1, NJT_C1_BUSY);
+        NJT_COUNT_ONE(NJT_C1_LOOPS);
 #if FRANK_AUDIO_DIAG
         /* The DWT comparator is per core, so core 1 has to arm its own.
          * Video and audio both run here and neither was ever watched. */
@@ -2321,7 +2361,11 @@ static void __not_in_flash_func(core1_entry)(void) {
             frank_mon_arm(FRANK_DIAG->mon_addr);
         }
 #endif
+#if !ADLIB_CORE1
+        /* The DMA wait is the pacing; with the idle hook installed this only
+         * takes microseconds out of the frame the hook is working inside. */
         sleep_us(1);
+#endif
     }
     __unreachable();
 }

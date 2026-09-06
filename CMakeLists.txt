@@ -541,6 +541,57 @@ endif()
 # smaller emu8950 scratch and the JIT diagnostics, so it lands 448 bytes
 # BELOW the footprint that is known to boot. 128 hot slots does not: that
 # was tried and stopped at DIAG_PRE_PC_NEW with a black screen.
+# How a loop gets noticed at all; see NJ_DISCOVERY_MASK in i386.c.  The hot
+# table is 2^NJIT_HOT_BITS slots of 20 bytes.
+set(NJIT_HOT_BITS "5" CACHE STRING "log2 of the hot-backedge table size")
+# Measured on hardware with 16-bit protected mode compiling (see FRANK_NJIT_PM16):
+# a 63 mask with threshold 3 and the keyless counters gives Tyrian 2000 2.458
+# MIPS against 2.391 with 15/2/off, and Draci historie 2.681 against 2.656.
+set(NJIT_DISCOVERY_MASK "63" CACHE STRING
+    "sample one uncompiled backedge in this many plus one")
+set(NJIT_HOT_THRESHOLD "3" CACHE STRING
+    "extra sightings a backedge needs before it is compiled")
+# Keyless hot counters; see FRANK_NJIT_HOT_COUNTERS in i386.c.  Needs
+# NJIT_INLINE_ENTRY off for the 4 KB.
+# 16-bit protected mode in the trace compiler; see FRANK_NJIT_PM16 in i386.c.
+# Measurement only: silence the periodic OPL refill to read the ceiling of
+# moving it off core 0.  Never ship a build with this on.
+option(FRANK_NO_ADLIB "Skip the periodic AdLib refill (measurement build)" OFF)
+# OPL synthesis on core 1, in the gap where it waits for the I2S DMA.
+# See FRANK_ADLIB_CORE1 in src/adlib.c.
+option(ADLIB_CORE1 "Synthesise the OPL on core 1" OFF)
+if(ADLIB_CORE1)
+    # The synthesis runs as the I2S driver's idle hook, inside the wait for
+    # the frame in flight.  A PWM board never calls repeat_me_often() into
+    # i2s_dma_write(), so the hook would never run and the OPL would be
+    # silent - a failure that looks like a missing sound card rather than a
+    # misconfigured build.  Refuse it here instead.
+    if(NOT AUDIO_TYPE STREQUAL "I2S")
+        message(FATAL_ERROR
+                "ADLIB_CORE1 needs AUDIO_TYPE=I2S: the OPL is pumped from the "
+                "I2S DMA wait, and a PWM build would produce silence.")
+    endif()
+    target_compile_definitions(${BUILD_NAME} PRIVATE ADLIB_CORE1=1)
+endif()
+if(FRANK_NO_ADLIB)
+    target_compile_definitions(${BUILD_NAME} PRIVATE FRANK_NO_ADLIB=1)
+endif()
+option(NJIT_PM16 "Compile 16-bit protected-mode traces" ON)
+if(NOT NJIT_PM16)
+    target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_PM16=0)
+endif()
+option(NJIT_HOT_COUNTERS "Hotness by a keyless counter array" ON)
+set(NJIT_HOT_CTR_BITS "12" CACHE STRING "log2 of the hot counter array")
+if(NJIT_HOT_COUNTERS)
+    target_compile_definitions(${BUILD_NAME} PRIVATE
+                               NJIT_HOT_COUNTERS=1
+                               NJ_HOT_CTR_BITS=${NJIT_HOT_CTR_BITS}u)
+endif()
+target_compile_definitions(${BUILD_NAME} PRIVATE
+                           NJ_HOT_BITS=${NJIT_HOT_BITS}u
+                           NJ_DISCOVERY_MASK=${NJIT_DISCOVERY_MASK}u
+                           NJ_HOT_THRESHOLD=${NJIT_HOT_THRESHOLD}u)
+
 option(NJIT_BIG_CACHE "Native JIT: 64-block cache and 64-slot hot table" OFF)
 if(NJIT_BIG_CACHE)
     target_compile_definitions(${BUILD_NAME} PRIVATE
@@ -595,6 +646,59 @@ if(DEFINED FLASH_RXDELAY)
     target_compile_definitions(${BUILD_NAME} PRIVATE FLASH_RXDELAY_OVERRIDE=${FLASH_RXDELAY})
 endif()
 
+# Probe the block cache every N interpreted instructions, not only at taken
+# backward branches.  0 disables it.  See nj_probe_existing().
+set(NJIT_PERIODIC_PROBE "0" CACHE STRING
+    "Interpreted instructions between lookup-only JIT probes (0 = off)")
+if(NOT NJIT_PERIODIC_PROBE STREQUAL "0")
+    target_compile_definitions(${BUILD_NAME} PRIVATE
+                               NJIT_PERIODIC_PROBE=${NJIT_PERIODIC_PROBE})
+endif()
+
+# Chains may compile a branch target while they are retiring fewer than this
+# many guest instructions.  0 disables the speculation.  Worth +139% on Doom's
+# renderer and it starves the OPL unless I2S_RING_FRAMES gives core 1 slack.
+set(NJ_CHAIN_COMPILE_BELOW "0" CACHE STRING "Speculate below this chain length (0 = off)")
+if(NOT NJ_CHAIN_COMPILE_BELOW STREQUAL "0")
+    target_compile_definitions(${BUILD_NAME} PRIVATE
+                               NJ_CHAIN_COMPILE_BELOW=${NJ_CHAIN_COMPILE_BELOW})
+endif()
+
+# Frames in the free-running I2S ring.  0 keeps the single-frame DMA that
+# needs core 1 back every 22.7 us.  A power of two; 64 is 1.45 ms of slack.
+set(I2S_RING_FRAMES "64" CACHE STRING "Frames in the free-running I2S DMA ring (0 = off)")
+if(NOT I2S_RING_FRAMES STREQUAL "0")
+    # audio.c is compiled into the audio_driver library, so a definition on
+    # ${BUILD_NAME} alone never reaches it - the first attempt at this silently
+    # built the old path and the counters gave it away by still advancing.
+    target_compile_definitions(audio_driver PRIVATE I2S_RING_FRAMES=${I2S_RING_FRAMES})
+    target_compile_definitions(${BUILD_NAME} PRIVATE I2S_RING_FRAMES=${I2S_RING_FRAMES})
+endif()
+
+# Measurement only: treat the VGA aperture as ordinary RAM in the generated
+# guard, so the cost of side-exiting on it can be measured.  The display stops
+# updating.  Never ship it.
+option(NJIT_VGA_UNSAFE "Measurement: no VGA aperture side exit (breaks video)" OFF)
+if(NJIT_VGA_UNSAFE)
+    target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_VGA_UNSAFE=1)
+endif()
+
+# Let a chain compile the target of a branch it exited through, instead of
+# stopping when no block exists there.  Measured at -12% on Tyrian with a
+# 32-block cache; Doom's chains are 1.11 blocks and may want it.
+option(NJIT_CHAIN_COMPILE "Chains may compile branch targets" OFF)
+if(NJIT_CHAIN_COMPILE)
+    target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_CHAIN_COMPILE=1)
+endif()
+
+# Count why native chains stop, for chainstat.py.  These are volatile
+# read-modify-writes on the per-block path - three of them for every block of
+# every chain - so they are off unless a measurement asks for them.
+option(NJIT_CHAINSTAT "Count why native chains stop (chainstat.py)" OFF)
+if(NJIT_CHAINSTAT)
+    target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_CHAINSTAT=1)
+endif()
+
 # Record the last sixteen native block exits in PSRAM; see FRANK_NJIT_EXIT_RING.
 # Note the ring lives in the guest's physical memory hole, which pc_new()
 # clears on every boot - so it is only readable with FAULT_PARK=ON, where the
@@ -608,6 +712,63 @@ if(NJIT_EXIT_CHECK)
     target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_EXIT_CHECK=1)
 endif()
 
+# SD card SPI clock in MHz.  The card clock only pays for the bytes, so this
+# matters most together with the read-ahead run in drivers/sdcard/sdcard.c.
+# Sequential read-ahead for the guest's disk image.  Worth a great deal when
+# the card's filesystem makes FatFS read one sector at a time - measured at
+# 25.6% of core 0 on a FAT32 card with a small cluster, halved by this - and
+# worth about 1% on exFAT, where disk_read is 1.5% to begin with.  It needs
+# 4 KB of SRAM, which only exists if the JIT entry is not inlined, and that
+# costs 1.9%; hence the two move together and default off.
+option(SD_READAHEAD "SD read-ahead; needs NJIT_INLINE_ENTRY off" OFF)
+
+# Inlining nj_try_execute() at every backward branch in the interpreter costs
+# 8 KB of static SRAM - the largest single block available on a board whose
+# heap headroom is under a kilobyte - and buys 1.9%.  Turning it off is how
+# anything else gets room: the SD read-ahead buffer, or NJIT_BIG_CACHE.
+option(NJIT_INLINE_ENTRY "Inline the JIT entry (8 KB of SRAM for 1.9%)" ON)
+if(NOT NJIT_INLINE_ENTRY)
+    target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_INLINE_ENTRY=0)
+endif()
+if(SD_READAHEAD)
+    if(NJIT_INLINE_ENTRY)
+        message(FATAL_ERROR
+                "SD_READAHEAD needs -DNJIT_INLINE_ENTRY=OFF for its buffer")
+    endif()
+    target_compile_definitions(${BUILD_NAME} PRIVATE SDCARD_READAHEAD=1)
+endif()
+
+set(SDCARD_CLK_MHZ "30" CACHE STRING "SD card SPI clock in MHz")
+# 0 leaves clk_peri where the SDK parks it (48 MHz from the USB PLL), which
+# caps the SD card at 24 MHz however high SDCARD_CLK_MHZ is set.
+set(PERI_CLOCK_MHZ "0" CACHE STRING "Peripheral clock in MHz, 0 = SDK default")
+target_compile_definitions(${BUILD_NAME} PRIVATE PERI_CLOCK_MHZ=${PERI_CLOCK_MHZ})
+target_compile_definitions(${BUILD_NAME} PRIVATE SDCARD_CLK_MHZ=${SDCARD_CLK_MHZ})
+
+# Cycle-exact top-level split of core 0; see src/njit_timeprof.h.
+option(NJIT_TIMEPROF "Measure where core 0 goes with the DWT cycle counter" OFF)
+if(NJIT_TIMEPROF)
+    target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_TIMEPROF=1)
+endif()
+
+# Segment loads inside a trace; see FRANK_NJIT_SEG_LOAD.  OFF: it is fast and
+# passes every host test, and it hangs M602 at random on the board.
+set(NJIT_SEG_LOAD "7" CACHE STRING
+    "Native JIT segment loads: 1=MOV r/m,Sreg 2=MOV Sreg,r/m 4=LES/LDS")
+target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_SEG_LOAD=${NJIT_SEG_LOAD})
+
+# Direct native access to the chain-4 VGA aperture; see FRANK_NJIT_VGA_DIRECT.
+option(NJIT_VGA_DIRECT "Native JIT: direct access to a linear VGA aperture" ON)
+if(NOT NJIT_VGA_DIRECT)
+    target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_VGA_DIRECT=0)
+endif()
+
+# Which memory-guard test refuses a native access; see FRANK_NJIT_GUARD_DIAG.
+option(NJIT_GUARD_DIAG "Native JIT: count memory-guard refusals by reason" OFF)
+if(NJIT_GUARD_DIAG)
+    target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_GUARD_DIAG=1)
+endif()
+
 # Out-of-line memory guard for the JIT; see FRANK_NJIT_SHARED_GUARD.
 if(NJIT_SHARED_GUARD)
     target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_SHARED_GUARD=1)
@@ -617,6 +778,13 @@ if(PC_SAMPLE)
     target_compile_definitions(${BUILD_NAME} PRIVATE
                                PC_SAMPLE=1
                                PC_SAMPLE_SHIFT=${PC_SAMPLE_SHIFT})
+    # Aim the same 512 buckets at one region.  Empty means the default window.
+    if(PS_BASE)
+        target_compile_definitions(${BUILD_NAME} PRIVATE PS_BASE=${PS_BASE})
+    endif()
+    if(PS_SPAN)
+        target_compile_definitions(${BUILD_NAME} PRIVATE PS_SPAN=${PS_SPAN})
+    endif()
     # Aim the same 512 buckets at the flash text instead of the RAM text.
     # Samples outside the window are counted but not placed, and on this board
     # 28% of them landed outside - i.e. in code running from flash.

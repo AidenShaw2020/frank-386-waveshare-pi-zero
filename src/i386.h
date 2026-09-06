@@ -141,6 +141,25 @@ struct CPUI386 {
 	void *int2f_opaque;
 
 	u32 a20_mask;  /* 0xFFFFFFFF = A20 on, 0xFFEFFFFF = A20 off */
+
+	/*
+	 * Native-JIT block linking accounting.  Generated code that jumps
+	 * straight back into its own body instead of returning to the C
+	 * dispatcher has to carry the retired-instruction count and the
+	 * dispatcher's step budget somewhere; there is no spare ARM register
+	 * once the eight guest GPRs, the CPU pointer, the budget/next-IP
+	 * carrier and the memory-guard scratch are allocated, so both live
+	 * here and are addressed off r12.
+	 *
+	 * njl_acc is cleared and njl_limit is set by nj_exec_loop() before
+	 * every native entry; only self-linking blocks read or write them.
+	 */
+	u32 njl_acc;
+	u32 njl_limit;
+	/* Instruction index inside the block that the last native link
+	 * jumped to, so an exit stub's static position still yields the
+	 * number actually retired. */
+	u32 njl_pos;
 };
 
 typedef struct CPUI386 CPUI386;
