@@ -56,6 +56,38 @@ This firmware is designed for RP2350-based boards with integrated VGA/HDMI, SD c
 
 > **Note:** When USB HID is enabled, the native USB port is used for keyboard/mouse input. USB serial console (CDC) is disabled in this mode; use UART for debug output.
 
+### First-time fix: PSRAM on a board with a non-Winbond flash chip
+
+Some RP2350 boards, the **Waveshare RP2350-PiZero** among them, ship with a
+flash chip from a manufacturer other than Winbond, typically Puya. On those
+chips the **Quad Enable (QE) bit in Status Register 2 is not set from the
+factory**. Together with PSRAM this makes the board lock up once the RP2350 is
+overclocked, which is exactly what this emulator does. Boards *without* PSRAM
+are unaffected.
+
+This is a property of the flash chip, not of the firmware, so no build option
+works around it. It is fixed once, permanently, with the
+[flash_config](https://github.com/fhoedemakers/flash_config) tool:
+
+1. Download the prebuilt
+   [`FLASH_QE_SET_1.uf2`](https://github.com/fhoedemakers/flash_config/blob/main/uf2/FLASH_QE_SET_1.uf2),
+   or build it from that repository's source.
+2. Put the board into BOOTSEL mode and copy the UF2 onto the `RPI-RP2` drive.
+3. It sets the QE bit and prints the flash status registers over USB serial.
+4. Flash the emulator firmware as usual.
+
+> **Caution:** Do not run `FLASH_QE_SET_1.uf2` a second time. A repeat run
+> fails, and the board then has to be recovered by erasing the flash with
+> `universal_flash_nuke.uf2` first.
+
+Credit for both the diagnosis and the tool goes to the pico-infonesPlus
+project; see [issue #191](https://github.com/fhoedemakers/pico-infonesPlus/issues/191).
+That project additionally reports non-Winbond boards as limited to 252 MHz
+after the fix. That limit does not hold here: the Z2 configuration in this
+repository runs a fixed Waveshare RP2350-PiZero at 504 MHz with PSRAM at
+166 MHz, so treat the ceiling as depending on the rest of the timing
+configuration rather than on the flash vendor alone.
+
 ## Board Configurations
 
 Four GPIO layouts are supported: **M1**, **M2**, **PC** (Olimex), and **Z2** (Waveshare).
