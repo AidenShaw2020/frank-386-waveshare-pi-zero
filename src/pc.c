@@ -1410,7 +1410,15 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	pc->vga = vga_init(pc->vga_mem, pc->vga_mem_size,
 			   fb, conf->width, conf->height);
 	vga_set_force_8dm(pc->vga, conf->vga_force_8dm);
-	pc->pci_vga = vga_pci_init(pc->vga, pc->pcibus, pc, set_pci_vga_bar);
+	/* Off presents a plain ISA VGA with no PCI function and no linear
+	 * framebuffer; see FRANK_PCI_VGA.  Keen 4 announces "SVGA Compatibility
+	 * Mode Enabled" and then mis-detects everything, so it is worth being able
+	 * to look like a 1991 card. */
+#ifndef FRANK_PCI_VGA
+#define FRANK_PCI_VGA 1
+#endif
+	pc->pci_vga = FRANK_PCI_VGA
+		? vga_pci_init(pc->vga, pc->pcibus, pc, set_pci_vga_bar) : NULL;
 	pc->pci_vga_ram_addr = -1;
 	disk_set_vga(pc->vga);
 
