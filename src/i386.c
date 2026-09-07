@@ -9821,10 +9821,22 @@ static bool nj_v7_emit_linear_to_phys_inline(CPUI386 *cpu, nj_emit_t *e,
  * r3 = guest physical address. Leave r3 unchanged on the success path.
  * ARM condition codes: HI=8, CC/LO=3, NE=1.
  */
+/*
+ * Whether this trace has emitted a guest store.
+ *
+ * The relaxed instruction floor wants to admit short *wait* loops - which
+ * only read - and not the short fragments a Mode X blit decomposes into,
+ * which store.  Every guest store passes through this function with write
+ * set, so one flag here catches them all, including the loop compilers'.
+ * Cleared at the top of nj_compile_v6_trace().
+ */
+static bool nj_trace_stored;
+
 static bool nj_v6_emit_mem_guard_inline(CPUI386 *cpu, nj_emit_t *e,
                                         unsigned size, bool write,
                                         nj_v6_guard_t *g)
 {
+    if (write) nj_trace_stored = true;
     if (!size || size > 4u ||
         (uword)cpu->phys_mem_size < size)
         return false;
@@ -11688,6 +11700,7 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
      * finds it.
      */
     int seg_write_at = -1;
+    nj_trace_stored = false;
     memset(nj_seg_dynamic, NJIT_SEG_ALLDYN ? 1 : 0, sizeof(nj_seg_dynamic));
     /* FS and GS have no entry-guard slot, so they are always read live; see
      * the FS/GS case in nj_v6_note_seg(). */
@@ -13432,7 +13445,8 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
 #define NJ_TRACE_MIN_INSNS_LINKED 2u
 #endif
     unsigned min_insns = nj_chain_continuation ? NJ_CONT_MIN_INSNS
-                       : self_links            ? NJ_TRACE_MIN_INSNS_LINKED
+                       : (self_links && !nj_trace_stored)
+                                               ? NJ_TRACE_MIN_INSNS_LINKED
                                                : NJ_TRACE_MIN_INSNS;
     if (trace16 && insns < min_insns) {
         NJ_V6_STOP[NJ_V6_BAIL_SHORT]++;
