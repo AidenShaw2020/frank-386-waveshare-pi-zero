@@ -514,7 +514,7 @@ static void njit_vga_write_update(VGAState *s)
         { g_njit_vga_why = 6; return; }
     }
 
-    if (s->gr[VGA_GFX_MODE] & 0x10)
+    if ((s->gr[VGA_GFX_MODE] & 0x10) || (s->gr[VGA_GFX_MISC] & 0x02))
         return;                         /* odd/even (text) mapping */
 
     /*
@@ -1991,7 +1991,26 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
 //            s->plane_updated |= mask; /* only used to detect font change */
 //            memory_region_set_dirty(&s->vram, addr, 1);
         }
-    } else if (s->gr[VGA_GFX_MODE] & 0x10) {
+    /*
+     * Odd/even (text) mapping.
+     *
+     * The test used to be gr[5] bit 4 alone.  That is the Graphics Mode
+     * register's odd/even bit, and it is not the one that decides how a CPU
+     * address reaches the planes: gr[6] bit 1, Chain Odd/Even, is what makes
+     * address bit 0 select the plane.  Software may leave gr[5] clear while
+     * gr[6] still says chain odd/even, and then this fell through to the
+     * planar branch below, which stores one *dword* per guest byte - so a
+     * character and its attribute landed in two adjacent cells instead of
+     * one.
+     *
+     * Commander Keen 4's loader does exactly that.  Everything DOS had
+     * already written stayed correct, and everything the loader wrote after
+     * it cleared gr[5] came out with the characters two cells apart:
+     * "S_V_G_A_ _C_o_m_p...", and the memory figures it patches into its own
+     * template never replaced the "xxxxx" placeholders.  Measured on the
+     * board at that moment: gr[5]=0x00, gr[6]=0x0e, sr[4]=0x02.
+     */
+    } else if ((s->gr[VGA_GFX_MODE] & 0x10) || (s->gr[VGA_GFX_MISC] & 0x02)) {
         /* odd/even mode (aka text mode mapping) */
         plane = (s->gr[VGA_GFX_PLANE_READ] & 2) | (addr & 1);
         mask = (1 << plane);
@@ -2128,8 +2147,9 @@ uint8_t __not_in_flash_func(vga_mem_read)(VGAState *s, uint32_t addr)
 //        assert(addr < s->vram_size);
         if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_forfeit();
         ret = s->vga_ram[addr];
-    } else if (s->gr[VGA_GFX_MODE] & 0x10) {
-        /* odd/even mode (aka text mode mapping) */
+    } else if ((s->gr[VGA_GFX_MODE] & 0x10) || (s->gr[VGA_GFX_MISC] & 0x02)) {
+        /* odd/even mode; the read path has to agree with the write path
+         * above, or a read-modify-write scrambles the screen. */
         plane = (s->gr[VGA_GFX_PLANE_READ] & 2) | (addr & 1);
         addr = ((addr & ~1) << 1) | plane;
         if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_forfeit();
