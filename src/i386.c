@@ -15502,6 +15502,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		 * over the edge, while every exception the guest actually takes
 		 * passes through here.  The block is in PSRAM, so it costs no SRAM.
 		 */
+#if NATIVE_JIT
 		{
 			volatile u32 *ex_ = NJ_V6_STOP;
 			if ((unsigned)cpu->excno < 32u) ex_[NJ_V6_EXC + cpu->excno]++;
@@ -15510,6 +15511,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			ex_[NJ_V6_EXC_LAST_CS]  = (u32)cpu->seg[SEG_CS].base;
 			ex_[NJ_V6_EXC_LAST_IP]  = (u32)cpu->ip;
 		}
+#endif
 		switch (cpu->excno) {
 		case EX_DF: case EX_TS: case EX_NP: case EX_SS: case EX_GP:
 		case EX_PF:
