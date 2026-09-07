@@ -94,6 +94,7 @@ void dolog(const char *fmt, ...)
 #define TRY(f) if(!(f)) { return false; }
 #define TRYL(f) if(unlikely(!(f))) { return false; }
 #define TRY1(f) if(unlikely(!(f))) { dolog("TRY1 @ %s %d\n", __func__, __LINE__); cpu_abort(cpu, -1); }
+
 #define THROW(ex, err) do { \
     dolog("THROW ex=%d err=%x eip=%08x cs=%04x %s:%d\n", \
           (ex), (unsigned)(err), cpu->ip, cpu->seg[SEG_CS].sel,  __func__, __LINE__); \
@@ -6036,6 +6037,58 @@ static inline void nj_xr_note(const nj_block_t *b, uword nip, int done)
  * whether a guest is in real mode or V86 has cost a build already. */
 #define NJ_V6_MODE_CR0     872
 #define NJ_V6_MODE_FLAGS   873
+/*
+ * Guest exceptions, by number, plus the last one in full.
+ *
+ * "The game never gets past DOS/4GW" and "the game freezes at its menu"
+ * look identical from outside and are not the same failure.  audiodiag.h
+ * answers this properly but is compiled out here, and turning it on costs
+ * SRAM the board does not have.  These slots cost none: the block already
+ * lives in the PSRAM hole at guest physical 0xa8000.
+ */
+#define NJ_V6_EXC          880   /* 880..911: one counter per exception */
+#define NJ_V6_EXC_LAST_NO  912
+#define NJ_V6_EXC_LAST_ERR 913
+#define NJ_V6_EXC_LAST_CS  914
+#define NJ_V6_EXC_LAST_IP  915
+/*
+ * Why the RET path refused, condition by condition.  Raptor refuses `ret
+ * imm16` 12 829 times in eight seconds and it has the flat 32-bit stack the
+ * original gate was written for, so the answer is one of the other three
+ * tests and guessing which has already cost one build.
+ */
+#define NJ_V6_RET_SEEN     916
+#define NJ_V6_RET_STACK    917   /* neither flat 32-bit nor 16-bit V86 */
+#define NJ_V6_RET_ROOM     918   /* imm16 does not fit the code window */
+#define NJ_V6_RET_SEG      919   /* nj_v6_note_seg refused SS */
+#define NJ_V6_RET_OK       920
+
+/* How many times a chain continuation must have been seen before it is
+ * compiled, while the gate is engaged; 0 disables it entirely.  See
+ * FRANK_NJIT_CHAIN_HOT and FRANK_NJIT_CHAIN_GATE in nj_exec_chain(). */
+/*
+ * OFF by default: measured, and it is a trade rather than a win.
+ *
+ *   gate         Raptor   Golden Axe   Bust-A-Move menu
+ *   off          0.182       3.240        4.851
+ *   four sights  0.662       4.176        2.842
+ *   one sight    0.662*      -            2.920 / 3.247 with a persistent mark
+ *
+ * Raptor is the case it is for: it compiles 27 804 blocks in eight seconds
+ * against 15 214 cache hits, with no flushes and 121 misses, so the emulator
+ * is in the compiler rather than the guest.  A larger block cache was tried
+ * first and changed nothing, which rules the working set out.
+ *
+ * Making it adaptive on the compile-to-hit ratio was tried too and did not
+ * engage on Raptor, so the signal needs work before this can ship on.
+ */
+#ifndef NJIT_CHAIN_HOT
+#define NJIT_CHAIN_HOT 0
+#endif
+static bool nj_chain_gate_on;
+static u32  nj_chain_gate_tick;
+static u32  nj_chain_gate_last_c;
+static u32  nj_chain_gate_last_h;
 
 /*
  * FRANK_NATIVE_JIT_V8_10_DIAG
@@ -9440,6 +9493,14 @@ static bool nj_v6_note_seg(CPUI386 *cpu, int seg,
     case SEG_CS: return true;  /* cs_base is already part of every cache guard */
     case SEG_FS: case SEG_GS:
         /*
+         * Not in 16-bit protected mode.  There the segment limit check baked
+         * by nj_v6_emit_mem_guard_inline() adds cpu->seg[nj_pm16_seg].base as
+         * an immediate, and a dynamic base is exactly what that cannot be
+         * combined with.  V86 and real mode do not take that path.
+         */
+        if (cpu->code16 && (cpu->cr0 & 1u) && !(cpu->flags & VM))
+            return false;
+        /*
          * FS and GS were interpreter-only because there is no use_fs/use_gs
          * for the entry guard to check a baked base against.  They do not
          * need one: nj_compile_v6_trace() marks them dynamic for every
@@ -10789,6 +10850,59 @@ static bool nj_v8_emit_io_in(nj_emit_t *e)
     return !e->failed;
 }
 
+/*
+ * OUT, the counterpart of nj_io_in().
+ *
+ * Dino Park is why: it draws through Mode X, so it reprograms the sequencer's
+ * plane mask constantly, and `out dx,al` ended 64.9% of every trace the
+ * compiler attempted - 588 of 906 in twelve seconds, for 7.8% coverage.
+ *
+ * One port range must stay with the interpreter whatever the permission says.
+ * A write to 0x1CE/0x1CF is the Bochs VBE index/data pair, and it reaches
+ * njit_vga_arena_release(), which moves the code arena out of the VGA buffer
+ * and then clears that buffer - while the block making the call is executing
+ * out of exactly that memory.  njit_vga_arena_release() documents the
+ * invariant it relies on ("a JIT block cannot reach a VGA write"), and that
+ * invariant is about *memory* writes; a compiled port write would be the one
+ * thing that breaks it.  Those are the only two ports that can: vga_initmode()
+ * is reached only from vga_init(), and every other port write touches data.
+ *
+ * Returns whether the write happened; false leaves the guest state untouched
+ * so the interpreter can redo the instruction and fault if it has to.
+ */
+static bool IRAM_ATTR nj_io_out(CPUI386 *cpu, unsigned port_and_size, u32 val)
+{
+    const int port = (int)(port_and_size & 0xffffu);
+    const unsigned size = port_and_size >> 16;
+    if ((port | 1) == 0x1cf)
+        return false;
+    if (!nj_io_allowed(cpu, port, size * 8u))
+        return false;
+    switch (size) {
+    case 1u:  cpu->cb.io_write8(cpu->cb.io, port, (u8)val); break;
+    case 2u:  cpu->cb.io_write16(cpu->cb.io, port, (u16)val); break;
+    default:  cpu->cb.io_write32(cpu->cb.io, port, val); break;
+    }
+    return true;
+}
+
+/*
+ * r1 carries the packed port and width, r2 the value; the answer comes back
+ * in r2, moved out of r0 before the pop overwrites it.
+ */
+static bool nj_v8_emit_io_out(nj_emit_t *e)
+{
+    nj_mov_reg(e, 0, NJ_CPU_REG);
+    nj_e16(e, 0xB503u);                 /* PUSH {r0, r1, lr} */
+    nj_mov_imm(e, 3, (u32)(uintptr_t)&nj_io_out | 1u);
+    nj_blx_reg(e, 3);
+    nj_mov_reg(e, 2, 0);                /* did it happen, before r0 returns */
+    nj_pop_low(e, 0x3u);                /* POP {r0, r1} */
+    nj_pop_lr(e);
+    nj_mov_reg(e, NJ_CPU_REG, 0);
+    return !e->failed;
+}
+
 static bool nj_v8_emit_generic_jcc_side_exit(nj_emit_t *e, nj_v8_exit_links_t *x,
                                               unsigned cc, uword target,
                                               uword instr_ip, unsigned completed)
@@ -11801,26 +11915,64 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
             break;
         }
 
-        /* RET/RET imm16 with 16/32-bit operand size, flat 32-bit stack. */
-        if ((op==0xc3 || op==0xc2) && cpu->sp_mask==0xffffffffu &&
-            cpu->seg[SEG_SS].limit==0xffffffffu &&
+        /*
+         * RET / RET imm16, 16- or 32-bit operand size.
+         *
+         * This used to require a flat 32-bit stack, which meant it never fired
+         * for a 16-bit guest - and the 16-bit stack path that PUSH/POP below
+         * gained for EMM386 was never carried across to it.  RET is the single
+         * most common reason the compiler gives up: two thirds of Aladdin's
+         * refusals, and Raptor refused `ret imm16` 15 062 times in eight
+         * seconds.  Each one is worse than it looks, because a refusal at a
+         * trace head makes nj_reject() poison that address and every later
+         * chain stops there.
+         *
+         * The wrap guard has to be emitted before the stack read it protects,
+         * which is why the guard is set up ahead of the effective address
+         * here, exactly as in the POP path.
+         */
+        bool ret_stack16 = mixed_v86 && cpu->sp_mask==0xffffu &&
+                           cpu->seg[SEG_SS].limit>=0xffffu;
+        if (op==0xc3 || op==0xc2) {
+            NJ_V6_STOP[NJ_V6_RET_SEEN]++;
+            if (!((cpu->sp_mask==0xffffffffu &&
+                   cpu->seg[SEG_SS].limit==0xffffffffu) || ret_stack16))
+                NJ_V6_STOP[NJ_V6_RET_STACK]++;
+            else if (op==0xc2 && op_pos+3u>avail)
+                NJ_V6_STOP[NJ_V6_RET_ROOM]++;
+            else if (!nj_v6_note_seg(cpu,SEG_SS,&use_ds,&use_es,&use_ss))
+                NJ_V6_STOP[NJ_V6_RET_SEG]++;
+            else
+                NJ_V6_STOP[NJ_V6_RET_OK]++;
+        }
+        if ((op==0xc3 || op==0xc2) &&
+            ((cpu->sp_mask==0xffffffffu &&
+              cpu->seg[SEG_SS].limit==0xffffffffu) || ret_stack16) &&
             (op!=0xc2 || op_pos+3u<=avail) &&
             nj_v6_note_seg(cpu,SEG_SS,&use_ds,&use_es,&use_ss)) {
+            bool stack16=ret_stack16;
             unsigned sw=px.op16?2u:4u;
             unsigned extra=op==0xc2?nj_rd16(code+op_pos+1u):0u;
-            nj_v6_ea_t sea={.base=4,.index=-1,.scale=0,.disp=0,.seg=SEG_SS,.used=0,.addr16=false};
-            nj_v6_emit_ea(cpu,&e,&sea,true);
             nj_v6_guard_t g;memset(&g,0,sizeof(g));
+            if(stack16 && sw>1u){
+                nj_mov_reg(&e,1,NJ_GUEST_REG(4));nj_uxth(&e,1,1);
+                nj_mov_imm(&e,2,0xffffu-(sw-1u));nj_cmp_reg(&e,1,2);
+                nj_v6_guard_add(&e,&g,8u); /* HI => the pop would wrap SS */
+            }
+            nj_v6_ea_t sea={.base=4,.index=-1,.scale=0,.disp=0,.seg=SEG_SS,.used=0,.addr16=stack16};
+            nj_v6_emit_ea(cpu,&e,&sea,true);
             if(!nj_v7_emit_linear_to_phys(cpu,&e,sw,false,&g)||
                !nj_v6_emit_mem_guard(cpu,&e,sw,false,&g)){
-                e.p=emit_before;e.failed=false;pos=ipos;break;
+                e.p=emit_before;e.failed=false;exits.n=exits_before;pos=ipos;break;
             }
             nj_v6_host_ptr(cpu,&e);
             if(sw==2u)nj_ldrh(&e,2,3,0);else nj_ldr32(&e,2,3,0);
             if(!nj_v8_finish_guard(&e,&g,&exits,gip,insns)) { e.p=emit_before; e.failed=false; exits.n=exits_before; pos=ipos; break; }
             nj_mov_reg(&e,NJ_BUDGET_REG,2);
-            nj_mov_reg(&e,1,NJ_GUEST_REG(4));nj_mov_imm(&e,2,sw+extra);nj_adds3(&e);
-            nj_mov_reg(&e,NJ_GUEST_REG(4),3);
+            nj_mov_reg(&e,1,NJ_GUEST_REG(4));if(stack16)nj_uxth(&e,1,1);
+            nj_mov_imm(&e,2,sw+extra);nj_adds3(&e);
+            if(stack16){nj_uxth(&e,3,3);nj_v6_write_r16(&e,4);}
+            else nj_mov_reg(&e,NJ_GUEST_REG(4),3);
             if(!nj_v8_exit_stub_lr(&e,&exits,insns+1u,gip)) { e.p=emit_before; e.failed=false; exits.n=exits_before; pos=ipos; break; }
             pos=op_pos+(op==0xc2?3u:1u);last_ip=gip;insns++;terminal_exit=true;continuation_ip=0;
             break;
@@ -12115,19 +12267,28 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
             }
         }
 
-        /* ---- byte accumulator immediate ALU (04/0C/24/2C/34/3C) ---- */
+        /* ---- byte accumulator immediate ALU (04/0C/24/2C/34/3C/A8) ----
+         *
+         * A8 is TEST AL,imm8: an AND that discards its result, and the byte
+         * counterpart of A9, which was already here.  Leaving it out was not
+         * cosmetic - `in al,dx / test al,8 / jnz` is how a DOS game waits for
+         * the VGA retrace, so the missing opcode stopped the trace two
+         * instructions in and the block fell under the six-instruction floor.
+         * Cyber Chess spent every one of its 317 compile attempts in twelve
+         * seconds that way, for 0.0% native coverage.
+         */
         if (!done && (op==0x04 || op==0x0c || op==0x24 ||
-                      op==0x2c || op==0x34 || op==0x3c)) {
+                      op==0x2c || op==0x34 || op==0x3c || op==0xa8)) {
             if (op_pos + 2u > avail) break;
             u8 imm=code[op_pos+1u];
             nj_v6_read_r8(&e,0); nj_mov_reg(&e,1,3);
             nj_mov_imm(&e,2,imm);
-            bool write_result = op != 0x3c;
+            bool write_result = op != 0x3c && op != 0xa8;
             unsigned fk,ccop;
             if(op==0x04){nj_adds3(&e);fk=NJ_FLAG_ARITH;ccop=CC_ADD;}
             else if(op==0x2c || op==0x3c){nj_subs3(&e);fk=NJ_FLAG_ARITH;ccop=CC_SUB;}
             else if(op==0x0c){nj_orr1(&e);nj_mov_reg(&e,3,1);fk=NJ_FLAG_LOGIC;ccop=CC_OR;}
-            else if(op==0x24){nj_and1(&e);nj_mov_reg(&e,3,1);fk=NJ_FLAG_LOGIC;ccop=CC_AND;}
+            else if(op==0x24 || op==0xa8){nj_and1(&e);nj_mov_reg(&e,3,1);fk=NJ_FLAG_LOGIC;ccop=CC_AND;}
             else {nj_eor1(&e);nj_mov_reg(&e,3,1);fk=NJ_FLAG_LOGIC;ccop=CC_XOR;}
             nj_uxtb(&e,3,3);
             if(write_result) nj_v6_write_r8(&e,0);
@@ -12371,6 +12532,34 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
             if (size == 1u)      nj_v6_write_r8(&e, 0);
             else if (size == 2u) nj_v6_write_r16(&e, 0);
             else                 nj_mov_reg(&e, NJ_GUEST_REG(0), 3);
+            pos = op_pos + (imm_port ? 2u : 1u); done = true;
+        }
+
+        /* ---- OUT DX and imm8, AL/AX/EAX ------------------------------ */
+        if (!done && (op == 0xee || op == 0xef || op == 0xe6 || op == 0xe7)) {
+            const bool imm_port = (op == 0xe6 || op == 0xe7);
+            const unsigned size = (op == 0xee || op == 0xe6)
+                                ? 1u : (px.op16 ? 2u : 4u);
+            if (imm_port && op_pos + 2u > avail) break;
+            nj_v6_guard_t g; memset(&g, 0, sizeof(g));
+            /* The port first: building it uses r2 as scratch, so the value
+             * has to be loaded after it. */
+            if (imm_port) nj_mov_imm(&e, 1, code[op_pos + 1u]);
+            else { nj_mov_reg(&e, 1, NJ_GUEST_REG(2)); nj_uxth(&e, 1, 1); }
+            nj_mov_imm(&e, 2, size << 16);
+            nj_orr1(&e);                      /* r1 = port | size << 16 */
+            if (size == 1u) { nj_v6_read_r8(&e, 0); nj_mov_reg(&e, 2, 3); }
+            else {
+                nj_mov_reg(&e, 2, NJ_GUEST_REG(0));
+                if (size == 2u) nj_uxth(&e, 2, 2);
+            }
+            if (!nj_v8_emit_io_out(&e)) break;
+            nj_cmp_imm0(&e, 2);
+            nj_v6_guard_add(&e, &g, 0u);      /* EQ => refused, nothing done */
+            if (!nj_v8_finish_guard(&e, &g, &exits, gip, insns)) {
+                e.p = emit_before; e.failed = false; exits.n = exits_before;
+                pos = ipos; break;
+            }
             pos = op_pos + (imm_port ? 2u : 1u); done = true;
         }
 
@@ -13133,11 +13322,83 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
      * there.  Draci historie refuses 322 traces here in fifteen seconds, a
      * third of everything it tries to compile.
      */
+    /*
+     * ...and a third case the floor gets wrong.
+     *
+     * A block whose backward branch lands on one of its own instruction
+     * boundaries does not pay the dispatcher once per iteration: the link
+     * trampoline built below turns that exit into a native branch and the
+     * loop spins inside the block.  The floor is there to amortise a *cold
+     * entry*, and a self-linking loop amortises it over every iteration it
+     * runs, so short ones are precisely the ones worth keeping rather than
+     * the ones worth refusing.
+     *
+     * Golden Axe is the case that showed it: 194 of the 195 traces it
+     * attempted in eight seconds were refused here, every one of them ending
+     * on a backward JZ, leaving 0.2% native coverage at 1.505 MIPS.
+     *
+     * This is the same scan the epilogue does to decide what to link; it is
+     * pure, so hoisting the question above the floor costs nothing but the
+     * loop itself.
+     */
+    /*
+     * Only a branch back to the block's own *entry* counts, not one that
+     * links into the middle.  A true small loop - which is what Golden Axe
+     * has - runs entirely inside the block once it is linked.  Accepting any
+     * internal link instead admitted a flood of two-instruction fragments,
+     * and on Bust-A-Move, whose menu already compiles plenty, those
+     * displaced the blocks that were doing the work: 4.851 MIPS at a floor of
+     * six against 3.354 at two and 3.493 at four, with native coverage
+     * falling from 77.6% to 66%.
+     */
+    bool self_links = false;
+    for (unsigned i = 0; i < exits.n && !self_links; ++i) {
+        if (exits.next_ip[i] == NJ_LINK_NONE) continue;
+        if (exits.next_ip[i] == start_ip && bclean[0] && seg_write_at < 0)
+            self_links = true;
+    }
+
 #ifndef NJ_TRACE_MIN_INSNS
 #define NJ_TRACE_MIN_INSNS 6u
 #endif
-    if (trace16 && insns < (nj_chain_continuation ? NJ_CONT_MIN_INSNS
-                                                  : NJ_TRACE_MIN_INSNS)) {
+/*
+ * Equal to the ordinary floor by default, i.e. off, because it too is a trade:
+ *
+ *   linked floor   Golden Axe   Bust-A-Move menu
+ *   6 (off)          1.505         4.851
+ *   4                  -           3.493
+ *   2                3.240         3.354
+ *
+ * Golden Axe wants it badly - 194 of its 195 traces are refused by the plain
+ * floor - and Bust-A-Move's menu pays for it, because the fragments it admits
+ * displace the blocks doing the work.  Restricting it to a branch back to the
+ * block's own entry did not recover Bust-A-Move either (3.197), so the cost is
+ * not only the fragments.
+ *
+ * ON at 2.  The full measurement is a trade, not a clean win:
+ *
+ *   at 2:  Cyber Chess 1.949 -> 3.469, Golden Axe 1.505 -> 3.780
+ *          Dino Park   2.315 -> 1.434, Bust-A-Move menu 4.851 -> 3.197
+ *
+ * Two games gained about 2x and two lost about a third.  Enabled at the
+ * user's decision, with the two losing games to be judged on hardware.
+ *
+ * The two it helps are wait loops - Cyber Chess spins on `in al,dx / test
+ * al,8 / jnz`, three instructions, so the A8 opcode alone does nothing for it
+ * while the floor still refuses the block - and the two it hurts draw through
+ * Mode X, where the fragments it admits displace the blocks doing the work.
+ * That is the discriminator to build on: a block that only reads is a wait
+ * loop and worth admitting short, a block that stores is not.  Restricting it
+ * to a branch back to the block's own entry was tried and is not enough
+ * (Bust-A-Move 3.197).
+ */
+#ifndef NJ_TRACE_MIN_INSNS_LINKED
+#define NJ_TRACE_MIN_INSNS_LINKED 2u
+#endif
+    unsigned min_insns = nj_chain_continuation ? NJ_CONT_MIN_INSNS
+                       : self_links            ? NJ_TRACE_MIN_INSNS_LINKED
+                                               : NJ_TRACE_MIN_INSNS;
+    if (trace16 && insns < min_insns) {
         NJ_V6_STOP[NJ_V6_BAIL_SHORT]++;
         return NULL;
     }
@@ -13652,6 +13913,56 @@ static int IRAM_ATTR nj_exec_chain(CPUI386 *cpu, const nj_block_t *first,
             break;
         }
 
+        /*
+         * FRANK_NJIT_CHAIN_HOT
+         *
+         * A chain used to compile a block for every address it reached that
+         * had none.  That is right when the code repeats and ruinous when it
+         * does not: Raptor compiled 27 804 blocks in eight seconds against
+         * 15 214 cache hits, with zero flushes and 121 misses, and ran at
+         * 0.182 MIPS - the emulator was spending its time in the compiler,
+         * not in the guest.  A bigger block cache was tried first and changed
+         * nothing, which is what ruled the working set out as the cause.
+         *
+         * Requiring the target to be hot first only *defers*; unlike
+         * nj_reject() it puts no mark on the address, so a chain that stops
+         * here is free to continue through it next time.
+         */
+#if NJIT_CHAIN_HOT && NJIT_HOT_COUNTERS
+        if (nj_chain_gate_on) {
+            /*
+             * Seen-before, not hot-enough.  nj_hot_enough() wants four
+             * sightings and that is far too strict here: it took Raptor from
+             * 0.182 to 0.662 MIPS but cost Bust-A-Move's menu 8.376 -> 2.842,
+             * because a menu compiles a bounded set of blocks once and then
+             * lives off them, and making each one wait four chain visits is
+             * pure warm-up cost.
+             *
+             * One repeat is enough to tell the two apart.  Code the chain
+             * never comes back to is never compiled, which is Raptor's whole
+             * problem, and code that repeats pays a single extra visit.
+             * A different mix from the backedge counters' so the two uses do
+             * not systematically collide.
+             */
+            u8 *seen = &nj_hot_ctr[nj_hash(nj_hot_context_key(cpu, linear) *
+                                           0x9E3779B1u, NJ_HOT_CTR_BITS)];
+            if (*seen < (u8)NJIT_CHAIN_HOT) {
+                (*seen)++;
+                NJCH_TICK(NJCH_BRK_COMPILE);
+                b = NULL;
+                break;
+            }
+            /*
+             * Deliberately not cleared.  Clearing it makes an address that
+             * has already proved it repeats serve its warm-up again after
+             * every eviction, and the array is shared with the backedge
+             * discovery, which clears its own entries - so the two uses were
+             * resetting each other.  Bust-A-Move's menu lost two thirds of
+             * its throughput to that.  Leaving the mark standing costs one
+             * byte that stays at the threshold.
+             */
+        }
+#endif
         nj_chain_continuation = true;
         b = nj_compile_loop_v45(cpu, ip);
         nj_chain_continuation = false;
@@ -13663,6 +13974,29 @@ static int IRAM_ATTR nj_exec_chain(CPUI386 *cpu, const nj_block_t *first,
     }
 
     if (n >= NJ_V8_CHAIN_MAX_BLOCKS) NJCH_TICK(NJCH_BRK_MAXBLOCKS);
+
+    /*
+     * FRANK_NJIT_CHAIN_GATE
+     *
+     * Whether to make continuations prove themselves is not a fixed policy;
+     * it depends entirely on the guest.  Requiring it unconditionally took
+     * Raptor from 0.182 to 0.662 MIPS and Bust-A-Move's menu from 8.376 down
+     * to 3.2, because the menu compiles a bounded set of blocks and then
+     * lives off them while Raptor never stops compiling new ones.
+     *
+     * The two are told apart by a number already being kept: a healthy guest
+     * hits the block cache far more often than it compiles, and a runaway one
+     * compiles about as often as it hits.  Sampled every 4096 chains, so the
+     * comparison itself costs nothing measurable.
+     */
+    if (++nj_chain_gate_tick >= 4096u) {
+        u32 c = g_njit_compiles, h = g_njit_hits;
+        u32 dc = c - nj_chain_gate_last_c, dh = h - nj_chain_gate_last_h;
+        nj_chain_gate_on = (dc > (dh >> 2));
+        nj_chain_gate_last_c = c;
+        nj_chain_gate_last_h = h;
+        nj_chain_gate_tick = 0;
+    }
 
     /* 1/16 exponential moving average of the guest instructions a chain
      * retires; see NJ_CHAIN_COMPILE_BELOW above for what reads it.  Two
@@ -15069,6 +15403,21 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		case EX_PF: g_wl_exc_pf++; break;
 		case EX_GP: g_wl_exc_gp++; break;
 		default:    g_wl_exc_other++; break;
+		}
+		/*
+		 * The delivered exception, for the host tools.  This is the one
+		 * place worth recording it: THROW expands at hundreds of sites and
+		 * putting the record there added 8 KB of .data and took the board
+		 * over the edge, while every exception the guest actually takes
+		 * passes through here.  The block is in PSRAM, so it costs no SRAM.
+		 */
+		{
+			volatile u32 *ex_ = NJ_V6_STOP;
+			if ((unsigned)cpu->excno < 32u) ex_[NJ_V6_EXC + cpu->excno]++;
+			ex_[NJ_V6_EXC_LAST_NO]  = (u32)cpu->excno;
+			ex_[NJ_V6_EXC_LAST_ERR] = (u32)cpu->excerr;
+			ex_[NJ_V6_EXC_LAST_CS]  = (u32)cpu->seg[SEG_CS].base;
+			ex_[NJ_V6_EXC_LAST_IP]  = (u32)cpu->ip;
 		}
 		switch (cpu->excno) {
 		case EX_DF: case EX_TS: case EX_NP: case EX_SS: case EX_GP:
