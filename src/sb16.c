@@ -57,6 +57,26 @@
 #define SB_DIAG_TIMECONST 961
 #define SB_DIAG_DACSAMP 962
 #define SB_DIAG_DACDROP 963
+/*
+ * The DSP conversation in order, for the host tools.  Totals say the guest
+ * talked to the card; only the order says where a handshake went wrong, and
+ * Sierra's SNDBLAST.DRV gives up after ten writes with no message beyond
+ * "Unable to initialize your music hardware."
+ */
+#define SB_RING_HEAD 1000
+#define SB_RING      1008      /* 1008..1039: port<<16 | val<<8 | isread */
+#define SB_RING_N    32
+/* Did the DMA engine ever call us, and did we ever ask it to? */
+#define SB_DIAG_DMACB   1040   /* SB_read_DMA entered */
+#define SB_DIAG_DMACMD  1041   /* dma_cmd8/dma_cmd issued */
+#define SB_DIAG_IRQ     1042   /* interrupts raised */
+#define SB_DIAG_HOLD    1043   /* last dma_running value */
+static inline void sb_ring_note(unsigned port, unsigned val, unsigned isread)
+{
+    const uint32_t h = SB_DIAG[SB_RING_HEAD] % SB_RING_N;
+    SB_DIAG[SB_RING + h] = (port << 16) | ((val & 0xffu) << 8) | isread;
+    SB_DIAG[SB_RING_HEAD]++;
+}
 
 
 #if defined(BUILD_ESP32) || defined(RP2350_BUILD)
@@ -215,6 +235,7 @@ static inline void sb_set_irq(SB16State *s, int level)
         __dmb();
         return;
     }
+    if (level) SB_DIAG[SB_DIAG_IRQ]++;
     s->set_irq(s->pic, s->irq, level);
 }
 
@@ -317,6 +338,8 @@ static void control (SB16State *s, int hold)
     int dma = s->use_hdma ? s->hdma : s->dma;
     IsaDma *isa_dma = s->use_hdma ? s->isa_hdma : s->isa_dma;
     s->dma_running = hold;
+    SB_DIAG[SB_DIAG_DMACMD]++;
+    SB_DIAG[SB_DIAG_HOLD] = (uint32_t)hold;
 
     ldebug ("hold %d high %d dma %d\n", hold, s->use_hdma, dma);
 
@@ -1214,6 +1237,7 @@ void sb16_dsp_write(void *opaque, uint32_t nport, uint32_t val)
     if (iport == 0x6) SB_DIAG[SB_DIAG_RESETS]++;
     else if (iport == 0xc) SB_DIAG[SB_DIAG_LASTCMD] = val;
     if ((unsigned)iport < 16u) SB_DIAG[SB_DIAG_WPORT + iport]++;
+    sb_ring_note((unsigned)iport, val, 0);
 
     ldebug ("write %#x <- %#x\n", nport, val);
     switch (iport) {
@@ -1296,7 +1320,8 @@ uint32_t sb16_dsp_read(void *opaque, uint32_t nport)
 {
     SB_DIAG[SB_DIAG_READS]++;
     { int rp = (int)(nport - ((SB16State *)opaque)->port);
-      if ((unsigned)rp < 16u) SB_DIAG[SB_DIAG_RPORT + rp]++; }
+      if ((unsigned)rp < 16u) SB_DIAG[SB_DIAG_RPORT + rp]++;
+      sb_ring_note((unsigned)rp, 0, 1); }
     SB16State *s = opaque;
     int iport, retval, ack = 0;
 
@@ -1662,6 +1687,7 @@ static int write_audio (SB16State *s, int nchan, int dma_pos,
 
 static int SB_read_DMA (void *opaque, int nchan, int dma_pos, int dma_len)
 {
+    SB_DIAG[SB_DIAG_DMACB]++;
     SB16State *s = opaque;
     int till, copy, written, free;
 
