@@ -1836,7 +1836,7 @@ void IRAM_ATTR vga_mem_write16(VGAState *s, uint32_t addr, uint16_t val16)
         /* VBE banking puts bank_offset up to 0x30000 on top of a 64 KB
          * window, so even this unchecked chain-4 store can reach the
          * region lent to the JIT.  See njit_vga_arena.h. */
-        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
+        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_forfeit();
     /* chain 4 mode : simplest access */
     plane = addr & 3;
     mask = (1 << plane);
@@ -1888,7 +1888,7 @@ void IRAM_ATTR vga_mem_write32(VGAState *s, uint32_t addr, uint32_t val)
         /* VBE banking puts bank_offset up to 0x30000 on top of a 64 KB
          * window, so even this unchecked chain-4 store can reach the
          * region lent to the JIT.  See njit_vga_arena.h. */
-        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
+        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_forfeit();
     /* chain 4 mode : simplest access */
     plane = addr & 3;
     mask = (1 << plane);
@@ -1932,7 +1932,7 @@ bool IRAM_ATTR vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, in
         break;
     }
 
-    if (addr + (uint32_t)len > NJ_VGA_ARENA_OFF) njit_vga_arena_release();
+    if (addr + (uint32_t)len > NJ_VGA_ARENA_OFF) njit_vga_arena_forfeit();
     /* chain 4 mode : simplest access */
     plane = addr & 3;
     mask = (1 << plane);
@@ -1983,7 +1983,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         plane = addr & 3;
         mask = (1 << plane);
         if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
-            if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
+            if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_forfeit();
             s->vga_ram[addr] = val;
 #ifdef DEBUG_VGA_MEM
             printf("vga: chain4: [0x" TARGET_FMT_plx "]\n", addr);
@@ -1997,7 +1997,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         mask = (1 << plane);
         if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
             addr = ((addr & ~1) << 1) | plane;
-            if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
+            if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_forfeit();
             if (addr >= s->vga_ram_size) {
                 return;
             }
@@ -2078,7 +2078,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
          * at the top of the buffer; chain 4 and odd/even are both bounded
          * below byte 131072.  See njit_vga_arena.h. */
         if (addr * sizeof(uint32_t) >= NJ_VGA_ARENA_OFF)
-            njit_vga_arena_release();
+            njit_vga_arena_forfeit();
         if (addr * sizeof(uint32_t) >= s->vga_ram_size) {
             return;
         }
@@ -2126,13 +2126,13 @@ uint8_t __not_in_flash_func(vga_mem_read)(VGAState *s, uint32_t addr)
     if (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) {
         /* chain 4 mode : simplest access */
 //        assert(addr < s->vram_size);
-        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
+        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_forfeit();
         ret = s->vga_ram[addr];
     } else if (s->gr[VGA_GFX_MODE] & 0x10) {
         /* odd/even mode (aka text mode mapping) */
         plane = (s->gr[VGA_GFX_PLANE_READ] & 2) | (addr & 1);
         addr = ((addr & ~1) << 1) | plane;
-        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_release();
+        if (addr >= NJ_VGA_ARENA_OFF) njit_vga_arena_forfeit();
         if (addr >= s->vga_ram_size) { // s->vram_size) {
             return 0xff;
         }
@@ -2140,7 +2140,7 @@ uint8_t __not_in_flash_func(vga_mem_read)(VGAState *s, uint32_t addr)
     } else {
         /* standard VGA latched access */
         if (addr * sizeof(uint32_t) >= NJ_VGA_ARENA_OFF)
-            njit_vga_arena_release();
+            njit_vga_arena_forfeit();
         if (addr * sizeof(uint32_t) >= s->vga_ram_size) {//s->vram_size) {
             return 0xff;
         }
