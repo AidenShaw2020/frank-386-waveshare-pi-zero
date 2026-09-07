@@ -9832,6 +9832,19 @@ static bool nj_v7_emit_linear_to_phys_inline(CPUI386 *cpu, nj_emit_t *e,
  */
 static bool nj_trace_stored;
 
+/*
+ * Whether this trace compiled a port access.
+ *
+ * A short self-linking block containing a compiled IN breaks Bust-A-Move,
+ * and it takes all three of A8, the relaxed floor and compiled IN to do it -
+ * remove any one and the game survives eight rounds of
+ * claude_handoff/bamstress.py, keep all three and it hangs in the first.
+ * What is wrong inside that block is not yet known; until it is, such a block
+ * simply does not get the relaxed floor.  Longer traces still compile IN as
+ * before, which is what Lemmings needs.
+ */
+static bool nj_trace_did_io;
+
 static bool nj_v6_emit_mem_guard_inline(CPUI386 *cpu, nj_emit_t *e,
                                         unsigned size, bool write,
                                         nj_v6_guard_t *g)
@@ -11701,6 +11714,7 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
      */
     int seg_write_at = -1;
     nj_trace_stored = false;
+    nj_trace_did_io = false;
     memset(nj_seg_dynamic, NJIT_SEG_ALLDYN ? 1 : 0, sizeof(nj_seg_dynamic));
     /* FS and GS have no entry-guard slot, so they are always read live; see
      * the FS/GS case in nj_v6_note_seg(). */
@@ -12315,7 +12329,7 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
  * block.
  */
 #ifndef NJIT_COMPILE_TEST_AL
-#define NJIT_COMPILE_TEST_AL 0
+#define NJIT_COMPILE_TEST_AL 1
 #endif
         if (!done && (op==0x04 || op==0x0c || op==0x24 ||
                       op==0x2c || op==0x34 || op==0x3c ||
@@ -12568,6 +12582,7 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
             nj_mov_imm(&e, 2, size << 16);
             nj_orr1(&e);                      /* r1 = port | size << 16 */
             if (!nj_v8_emit_io_in(&e)) break;
+            nj_trace_did_io = true;
             nj_cmp_imm0(&e, 2);
             nj_v6_guard_add(&e, &g, 0u);      /* EQ => the port is trapped */
             if (!nj_v8_finish_guard(&e, &g, &exits, gip, insns)) {
@@ -12603,6 +12618,7 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
                 if (size == 2u) nj_uxth(&e, 2, 2);
             }
             if (!nj_v8_emit_io_out(&e)) break;
+            nj_trace_did_io = true;
             nj_cmp_imm0(&e, 2);
             nj_v6_guard_add(&e, &g, 0u);      /* EQ => refused, nothing done */
             if (!nj_v8_finish_guard(&e, &g, &exits, gip, insns)) {
@@ -13445,7 +13461,7 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
 #define NJ_TRACE_MIN_INSNS_LINKED 2u
 #endif
     unsigned min_insns = nj_chain_continuation ? NJ_CONT_MIN_INSNS
-                       : (self_links && !nj_trace_stored)
+                       : (self_links && !nj_trace_stored && !nj_trace_did_io)
                                                ? NJ_TRACE_MIN_INSNS_LINKED
                                                : NJ_TRACE_MIN_INSNS;
     if (trace16 && insns < min_insns) {
