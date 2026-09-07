@@ -1399,6 +1399,12 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	 * of this buffer, and both are hooked, so lend it to the JIT.  See
 	 * njit_vga_arena.h. */
 	if (pc->vga_mem_size >= NJ_VGA_ARENA_OFF + NJ_VGA_ARENA_LEN)
+		/* Off lends the JIT nothing and keeps every byte of video memory
+		 * for the guest; see NJIT_VGA_ARENA in njit_vga_arena.h. */
+#ifndef NJIT_VGA_ARENA
+#define NJIT_VGA_ARENA 1
+#endif
+		if (NJIT_VGA_ARENA)
 		njit_vga_arena_offer(pc->vga_mem + NJ_VGA_ARENA_OFF,
 				     NJ_VGA_ARENA_LEN);
 	pc->vga = vga_init(pc->vga_mem, pc->vga_mem_size,

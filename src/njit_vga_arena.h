@@ -66,6 +66,9 @@ void njit_vga_arena_release(void);
  * compile path, where no block can be executing. */
 void njit_vga_arena_rearm(void);
 
+/* The guest has stored something there; never lend it again. */
+void njit_vga_arena_forfeit(void);
+
 /*
  * Direct native writes to the 0xA0000-0xBFFFF aperture.
  *
