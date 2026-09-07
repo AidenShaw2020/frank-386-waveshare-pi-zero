@@ -12329,7 +12329,7 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
  * block.
  */
 #ifndef NJIT_COMPILE_TEST_AL
-#define NJIT_COMPILE_TEST_AL 1
+#define NJIT_COMPILE_TEST_AL 0
 #endif
         if (!done && (op==0x04 || op==0x0c || op==0x24 ||
                       op==0x2c || op==0x34 || op==0x3c ||
