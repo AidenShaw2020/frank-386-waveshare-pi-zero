@@ -33,6 +33,32 @@
 #include "i8257.h"
 #include <hardware/sync.h>
 
+/*
+ * Does the guest talk to the card at all?
+ *
+ * The refill and rate counters below only move once a transfer has been
+ * programmed, so they cannot tell "the game never found the card" from "the
+ * game found it and the DMA is broken".  These do: one counts every DSP
+ * command byte the guest writes, the other every DSP reset it performs, which
+ * is how detection starts.  They live in the PSRAM diagnostic block, so they
+ * cost no SRAM and nothing on any path that does not touch 0x22x.
+ */
+#define SB_DIAG ((volatile uint32_t *)(0x11000000u + 0x000a8000u))
+#define SB_DIAG_WRITES 924
+#define SB_DIAG_RESETS 925
+#define SB_DIAG_READS  926
+#define SB_DIAG_LASTCMD 927
+/* 928..943: writes by port offset, 944..959: reads by port offset.  A poll
+ * loop is invisible in a single "last command" but obvious as soon as the
+ * offsets it hammers are counted separately. */
+#define SB_DIAG_WPORT  928
+#define SB_DIAG_RPORT  944
+#define SB_DIAG_DACFREQ 960
+#define SB_DIAG_TIMECONST 961
+#define SB_DIAG_DACSAMP 962
+#define SB_DIAG_DACDROP 963
+
+
 #if defined(BUILD_ESP32) || defined(RP2350_BUILD)
 void *pcmalloc(long size);
 #else
@@ -121,6 +147,12 @@ struct SB16State {
 #define AUDIO_BUF_LEN 4096
     uint8_t audio_buf[AUDIO_BUF_LEN];
     unsigned int audio_p, audio_q;
+    /* Direct DAC (DSP command 0x10): when the previous sample arrived,
+     * and the rate they are arriving at.  See sb16_direct_dac(). */
+    uint32_t dac_win_us;      /* start of the current measuring window */
+    uint32_t dac_win_n;       /* samples taken in it */
+    uint32_t dac_freq;        /* what the consumer is being told to play at */
+    uint8_t  dac_hold;        /* filling: the consumer must not advance yet */
     void *voice;
     int active_out;
 
@@ -514,6 +546,114 @@ static inline uint8_t dsp_get_data (SB16State *s)
     }
 }
 
+/*
+ * DSP command 0x10, Direct DAC output.
+ *
+ * The sample used to be fetched and thrown away, so a game that plays this
+ * way got silence from the Sound Blaster while its FM music kept working -
+ * exactly what Elder Body does.  Measured: 985 211 writes to the command port
+ * in 45 seconds, one single read of the data port, and every DMA counter
+ * still at zero.  That is not a transfer, it is the guest handing over one
+ * sample at a time.
+ *
+ * There is no programmed rate to play them back at - the game sets the tempo
+ * by how fast it writes - so the rate is measured from the arrivals.  An
+ * eighth-weighted average keeps one late sample from moving it, and the clamp
+ * keeps a stall from producing an absurd frequency.  Playing at the rate they
+ * arrive reproduces what the guest actually produced per second of real time,
+ * which is the best that can be done when the emulator is not running at the
+ * speed the game assumed.
+ */
+static void sb16_direct_dac (SB16State *s, uint8_t sample)
+{
+    const uint32_t now = time_us_32();
+
+    /*
+     * Measure over a window, not per sample.
+     *
+     * The first version recomputed the rate from every gap between two
+     * samples and handed the result straight to the resampler.  Each gap is
+     * around 115 us and the emulator's own jitter is a large fraction of
+     * that, so the source rate moved constantly and the output was audibly
+     * rough.  Measured on Elder Body: samples really arrive at 8671 Hz, the
+     * per-sample estimate wandered between 8453 and 8541, and nothing was
+     * being dropped - so the distortion was the moving rate, not the buffer.
+     *
+     * 512 samples is about 60 ms, long enough to average the jitter out and
+     * short enough to follow a game that changes rate.
+     */
+    if (!s->dac_win_us) {
+        s->dac_win_us = now;
+        s->dac_win_n = 0;
+        s->dac_hold = 1;              /* fill before playing anything */
+    }
+    s->dac_win_n++;
+    const uint32_t win = now - s->dac_win_us;
+    if (s->dac_win_n >= 512u && win > 1000u) {
+        uint32_t f = (uint32_t)(((uint64_t)s->dac_win_n * 1000000u) / win);
+
+        /*
+         * Then hold the buffer near half full.  The guest delivers in bursts
+         * - it runs at whatever speed the emulator gives it - so a rate that
+         * is merely correct on average still lets the buffer drift to empty
+         * or full, and both are heard.  A 1.5% nudge is below the threshold
+         * where pitch is noticeable and is enough to keep it centred.
+         */
+        const unsigned level = s->audio_q - s->audio_p;
+        if (level > (AUDIO_BUF_LEN * 3u) / 4u) f += f / 64u;
+        else if (level < AUDIO_BUF_LEN / 4u)   f -= f / 64u;
+
+        if (f < 4000u)  f = 4000u;
+        if (f > 44100u) f = 44100u;
+        s->dac_freq = f;
+        s->dac_win_us = now;
+        s->dac_win_n = 0;
+    }
+    if (!s->dac_freq) s->dac_freq = 8000u;
+
+    s->fmt = AUDIO_FORMAT_U8;
+    s->fmt_bits = 8;
+    s->fmt_signed = 0;
+    s->fmt_stereo = 0;
+    s->freq = (int)s->dac_freq;
+
+    /*
+     * Hold the consumer off until there is a cushion.
+     *
+     * Without one the buffer sat at a single sample: the consumer at 44.1 kHz
+     * took each sample as soon as it was written, so what came out was not a
+     * steady 8.6 kHz stream but a copy of however irregularly the emulator
+     * happened to hand the guest its time slices.  That irregularity is what
+     * was heard as distortion - the rate was right on average and nothing was
+     * being dropped.
+     *
+     * 1024 samples is about 120 ms at these rates, enough to ride out the
+     * emulator's jitter and short enough not to be noticed as lag on a sound
+     * effect.  Playback stops again if it ever drains, rather than limping
+     * along on an empty buffer.
+     */
+    {
+        const unsigned lvl = s->audio_q - s->audio_p;
+        if (s->dac_hold) {
+            if (lvl >= 1024u) s->dac_hold = 0;
+        } else if (lvl == 0u) {
+            s->dac_hold = 1;
+        }
+    }
+
+    SB_DIAG[SB_DIAG_DACFREQ] = s->dac_freq;
+    SB_DIAG[SB_DIAG_TIMECONST] = (uint32_t)(s->audio_q - s->audio_p);
+    SB_DIAG[SB_DIAG_DACSAMP]++;
+    if ((unsigned)(s->audio_q - s->audio_p) < AUDIO_BUF_LEN) {
+        s->audio_buf[s->audio_q % AUDIO_BUF_LEN] = sample;
+        s->audio_q++;
+    } else {
+        SB_DIAG[SB_DIAG_DACDROP]++;
+    }
+    speaker (s, 1);
+}
+
+
 static void command (SB16State *s, uint8_t cmd)
 {
     ldebug ("command %#x\n", cmd);
@@ -881,7 +1021,7 @@ static void complete (SB16State *s)
 
         case 0x10:
             d0 = dsp_get_data (s);
-            dolog ("cmd 0x10 d0=%#x\n", d0);
+            sb16_direct_dac (s, (uint8_t)d0);
             break;
 
         case 0x14:
@@ -1070,6 +1210,10 @@ void sb16_dsp_write(void *opaque, uint32_t nport, uint32_t val)
     iport = nport - s->port;
 
     frank_diag_ev(FRANK_EV_DSP_W, (uint8_t)iport, 0, val);
+    SB_DIAG[SB_DIAG_WRITES]++;
+    if (iport == 0x6) SB_DIAG[SB_DIAG_RESETS]++;
+    else if (iport == 0xc) SB_DIAG[SB_DIAG_LASTCMD] = val;
+    if ((unsigned)iport < 16u) SB_DIAG[SB_DIAG_WPORT + iport]++;
 
     ldebug ("write %#x <- %#x\n", nport, val);
     switch (iport) {
@@ -1150,6 +1294,9 @@ void sb16_dsp_write(void *opaque, uint32_t nport, uint32_t val)
 
 uint32_t sb16_dsp_read(void *opaque, uint32_t nport)
 {
+    SB_DIAG[SB_DIAG_READS]++;
+    { int rp = (int)(nport - ((SB16State *)opaque)->port);
+      if ((unsigned)rp < 16u) SB_DIAG[SB_DIAG_RPORT + rp]++; }
     SB16State *s = opaque;
     int iport, retval, ack = 0;
 
@@ -1999,6 +2146,10 @@ void __not_in_flash_func(sb16_getsample)(SB16State *s, int* r_v, int* l_v) {
         }
         if (len < g_sb16_minfill) g_sb16_minfill = len;
     }
+
+    /* Direct DAC is still filling its cushion; see sb16_direct_dac(). */
+    if (s->dac_hold && !s->active_out)
+        return;
 
     static uint32_t phase = 0;
     uint32_t step = ((uint32_t)s->freq << 16) / 44100;
