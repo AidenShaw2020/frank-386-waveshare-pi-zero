@@ -91,13 +91,9 @@ extern int gfx_line_offset;  // Words per line (40 for 320px EGA, 80 for 640px)
 extern int gfx_sram_stride;  // Words per line in SRAM buffer (width/8 + 1)
 
 extern volatile uint32_t frame_update_request;
-/* Fixed-scanline palette sample; see FRANK_VGA_PALETTE_SAMPLE_POINT in
- * drivers/vga/vga_hw.c. */
-void vga_hw_snapshot_palette16(void);
 static void hdmi_pal_track(void);
 void vga_get_palette16(VGAState *s, uint8_t *palette16);
 void vga_hw_set_palette16(const uint8_t *palette16_data);
-#define HDMI_PALETTE_SAMPLE_LINE 240u
 extern const uint32_t * volatile hdmi_ega320_cache_active;
 extern const uint32_t * volatile hdmi_ega320_cache_pending;
 
@@ -1246,9 +1242,6 @@ static void __time_critical_func(dma_handler_HDMI)() {
             frame_vram_offset = (uint16_t)((hi << 8) | lo);
         }
     }
-
-    if (line == HDMI_PALETTE_SAMPLE_LINE)
-        vga_hw_snapshot_palette16();
 
     /* Follow a mid-frame palette change; see FRANK_HDMI_RASTER_SPLIT. */
     if (gfx_submode == 2 && line < 480)
