@@ -12512,7 +12512,11 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
         }
 
         /* ---- IN AL/AX/EAX, DX and imm8 -------------------------------- */
-        if (!done && (op == 0xec || op == 0xed || op == 0xe4 || op == 0xe5)) {
+#ifndef NJIT_COMPILE_IN
+#define NJIT_COMPILE_IN 1
+#endif
+        if (NJIT_COMPILE_IN && !done &&
+            (op == 0xec || op == 0xed || op == 0xe4 || op == 0xe5)) {
             const bool imm_port = (op == 0xe4 || op == 0xe5);
             const unsigned size = (op == 0xec || op == 0xe4)
                                 ? 1u : (px.op16 ? 2u : 4u);
@@ -12536,7 +12540,11 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
         }
 
         /* ---- OUT DX and imm8, AL/AX/EAX ------------------------------ */
-        if (!done && (op == 0xee || op == 0xef || op == 0xe6 || op == 0xe7)) {
+#ifndef NJIT_COMPILE_OUT
+#define NJIT_COMPILE_OUT 1
+#endif
+        if (NJIT_COMPILE_OUT && !done &&
+            (op == 0xee || op == 0xef || op == 0xe6 || op == 0xe7)) {
             const bool imm_port = (op == 0xe6 || op == 0xe7);
             const unsigned size = (op == 0xee || op == 0xe6)
                                 ? 1u : (px.op16 ? 2u : 4u);
