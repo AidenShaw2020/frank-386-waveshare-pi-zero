@@ -1089,42 +1089,6 @@ static void __time_critical_func(render_line)(uint32_t line, uint32_t *output_bu
 static inline void vga_hw_set_mode(int mode);
 void vga_hw_set_text_palette(const uint8_t *palette16_data);
 
-/*
- * FRANK_VGA_PALETTE_SAMPLE_POINT
- *
- * The renderer rebuilds its colour table once per frame, from whatever the
- * guest's palette happens to be when the deferred frame work runs.  A game
- * that changes the palette mid-frame - a raster split, one palette for the
- * playfield and another for a status bar - therefore hands this code a
- * different answer every frame, and the WHOLE screen alternates between the
- * two palettes.
- *
- * Lemmings does exactly that.  Measured on its level briefing: two complete
- * palettes swapping 160 times a second, 85% of the time in one and 11% in
- * the other, while the framebuffer itself did not change by a single byte
- * over 250 ms.  What the user saw was coloured fragments flickering across
- * the picture, and the rate of the flicker followed how fast the game got
- * round its raster loop.
- *
- * Sampling at a fixed scanline makes the choice deterministic and the
- * flicker stops.  The split is still not reproduced - the region below the
- * sample point keeps the playfield's colours - but the sample is taken in
- * the middle of the visible area, so the part that is right is the part the
- * game is played in.
- */
-static uint8_t snap_pal16[48];
-static volatile bool snap_pal16_valid;
-
-/* Deliberately NOT __time_critical_func: it runs once per frame, and putting
- * it in RAM pushed .data past the 4 KB boundary .bss is aligned to, costing
- * 4192 bytes for 96 bytes of arrays and leaving the board on a black screen.
- * vga_get_palette16() is already resident, so the loop itself still is. */
-void vga_hw_snapshot_palette16(void) {
-    if (!vga_state) return;
-    vga_get_palette16(vga_state, snap_pal16);
-    snap_pal16_valid = true;
-}
-
 static void vga_hw_new_frame_deferred(void) {
     if (!vga_state) return;
     static int last_vga_mode = -1;
@@ -1219,19 +1183,20 @@ static void vga_hw_new_frame_deferred(void) {
              * conv_color and rebuilding here would fight it. */
             if ((palette_dirty || mode_changed || submode_changed) &&
                 (SELECT_VGA || !hdmi_palette_split_active())) {
-                /* The snapshot is handed over directly.  Copying it into a
-                 * local first, and skipping the rebuild when it had not
-                 * changed, cost 188 bytes of .data here - and .data had 260
-                 * bytes left before the 4 KB boundary .bss is aligned to, so
-                 * the whole build moved up 4 KB and the board came up on a
-                 * black screen. */
-                if (snap_pal16_valid) {
-                    vga_hw_set_palette16(snap_pal16);
-                } else {
-                    uint8_t ega_pal[48];
-                    vga_get_palette16(vga_state, ega_pal);
-                    vga_hw_set_palette16(ega_pal);
-                }
+                /*
+                 * Read the palette live, here, after the frame.  A fixed
+                 * scanline sample was tried and is wrong: the sample can land
+                 * in the middle of the guest's write burst, and because this
+                 * rebuild only runs while palette_dirty is set, the torn
+                 * palette captured on the last frame of a fade then stays on
+                 * screen for good - Commander Keen came up permanently dark
+                 * that way.  The alternating-palette case that sample was
+                 * meant for is handled properly by the raster-split cache,
+                 * which owns conv_color once it engages.
+                 */
+                uint8_t ega_pal[48];
+                vga_get_palette16(vga_state, ega_pal);
+                vga_hw_set_palette16(ega_pal);
             }
             last_gfx_submode = new_gfx_submode;
             return;
@@ -1393,10 +1358,6 @@ static void __isr __time_critical_func(dma_handler_vga)(void) {
     if (prev_line != 0xFFFFFFFF && line > prev_line + 1)
         missed_isr_count += line - prev_line - 1;
     prev_line = line;
-
-    /* Deterministic palette sample point; see FRANK_VGA_PALETTE_SAMPLE_POINT. */
-    if (line == N_LINES_VISIBLE / 2u)
-        vga_hw_snapshot_palette16();
 
     if (line >= N_LINES_TOTAL) {
         line = current_line = prev_line = 0;
