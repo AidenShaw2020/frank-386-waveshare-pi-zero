@@ -2721,7 +2721,24 @@ int __time_critical_func(vga_get_graphics_mode)(VGAState *s, int *width, int *he
     if (!(s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) &&   /* chain4 OFF */
          (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_SEQ_MODE) &&  /* sequential ON */
          (s->ar[0x10] & 0x40) &&                               /* 8-bit DAC color */
-         w == 320) {
+         w >= 256 && w <= 400) {
+        /*
+         * The width used to have to be exactly 320, and Mode X is not a
+         * single resolution: 256, 320, 360 and 400 wide are all ordinary
+         * tweaks of it.  Dyna Blaster programs 256x232 - CRTC 64 characters
+         * with the 256-colour shift, so w comes out 256 - and fell through
+         * to chain 4, which reads the same memory as one linear byte per
+         * pixel instead of four interleaved planes.  Half the picture, drawn
+         * over itself.
+         *
+         * Nothing is lost by widening it.  The attribute controller's 8-bit
+         * DAC bit above is what separates a 256-colour mode from a 16-colour
+         * planar one, and that is the distinction the width was standing in
+         * for; a 640-wide EGA mode fails that test on its own.  The width is
+         * still bounded because shift_control, which would say this directly,
+         * cannot be trusted - Wolf3D rewrites GR[5] on every write mode
+         * change, which is what the note above is about.
+         */
         rv = 5;  // Mode X
     } else if (shift_control == 0) {
         if ((s->gr[0x06] & 0x0C) == 0x0C && w >= 640)
