@@ -34,6 +34,27 @@
 #include "emu8950/emu8950.h"
 #if defined(RP2350_BUILD)
 #include "board_config.h"
+
+/*
+ * A ring of what the guest does to the OPL, for the host tools.
+ *
+ * AdLib detection is a fixed handshake - mask the timers, reset, read the
+ * status, start timer 1, wait, read again - and a game that decides the card
+ * is absent has seen one of those reads return the wrong thing.  The totals
+ * cannot show that; the order can.  Lives in the PSRAM diagnostic block, so
+ * it costs no SRAM.
+ */
+#define OPL_DIAG ((volatile uint32_t *)(0x11000000u + 0x000a8000u))
+#define OPL_DIAG_HEAD  964
+#define OPL_DIAG_RING  968      /* 968..999: reg<<16 | val<<8 | isread */
+#define OPL_DIAG_N     32
+static inline void opl_diag_note(unsigned reg, unsigned val, unsigned isread)
+{
+    const uint32_t h = OPL_DIAG[OPL_DIAG_HEAD] % OPL_DIAG_N;
+    OPL_DIAG[OPL_DIAG_RING + h] = (reg << 16) | ((val & 0xffu) << 8) | isread;
+    OPL_DIAG[OPL_DIAG_HEAD]++;
+}
+
 #endif
 
 /* __dmb() is a CMSIS intrinsic; pico.h should pull it in transitively,
@@ -257,6 +278,7 @@ void adlib_write(void *opaque, uint32_t nport, uint32_t val)
             {
                 const uint8_t reg = (uint8_t)s->adlib_register;
                 frank_diag_opl_write(nport, reg, (uint8_t)val, 1);
+                if (reg <= 4) opl_diag_note(reg, (unsigned)val, 0);
                 if (reg <= 4) {
                     if (reg == 0)
                         s->adlibregmem[0] = (uint16_t)((s->adlibregmem[0] &
@@ -283,13 +305,32 @@ uint32_t adlib_read(void *opaque, uint32_t nport)
         case 0x228: case 0x229:
         case 0x220: case 0x221:
             FRANK_DIAG_COUNT(opl_status);
-            if (!s->adlibregmem[4])
-                s->adlibstatus = 0;
-            else
-                s->adlibstatus = 0x80;
-            s->adlibstatus = s->adlibstatus
-                           + (s->adlibregmem[4] & 1) * 0x40
-                           + (s->adlibregmem[4] & 2) * 0x10;
+            opl_diag_note(0xff, 0, 1);
+            /*
+             * Status from the timer control register, honouring the masks.
+             *
+             * Register 4 is: bit 0 start timer 1, bit 1 start timer 2, bit 5
+             * mask timer 2, bit 6 mask timer 1, bit 7 reset the IRQ.  A
+             * masked timer still runs but its flag never reaches the status
+             * byte.  The old expression ignored the mask bits entirely and
+             * derived the flags from the start bits alone, which happens to
+             * satisfy the usual detection - 0x60, 0x80, read 0x00, 0x21,
+             * read 0xC0 - and fails any other order.
+             *
+             * Fox does it differently: reg 1 <- 0x20, reg 4 <- 0x63, read.
+             * 0x63 starts both timers and masks both, so the answer is 0x00;
+             * the old code returned 0xE0, the game concluded there was no
+             * AdLib and fell back to the PC speaker.
+             */
+            {
+                const unsigned tc = s->adlibregmem[4];
+                unsigned st = 0;
+                if ((tc & 0x01u) && !(tc & 0x40u)) st |= 0x40u;  /* timer 1 */
+                if ((tc & 0x02u) && !(tc & 0x20u)) st |= 0x20u;  /* timer 2 */
+                if (st) st |= 0x80u;                             /* IRQ */
+                s->adlibstatus = (uint8_t)st;
+            }
+            opl_diag_note(0xfe, s->adlibstatus, 1);
             return s->adlibstatus;
     }
     return 0xFF;
