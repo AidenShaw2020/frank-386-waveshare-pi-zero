@@ -5817,8 +5817,32 @@ void njit_vga_arena_release(void)
     nj_arena_switch(nj_code, NJ_CODE_BYTES / 2u);
 }
 
+/*
+ * Once the guest has stored anything in the borrowed region, it is the
+ * guest's for good.
+ *
+ * Releasing on the offending write is not enough on its own, because the
+ * region is offered again at every mode change - and a game that keeps data
+ * up there across a mode set then has it overwritten by the next block the
+ * JIT compiles.  Commander Keen does exactly that: it holds its tile
+ * graphics in high video memory, and what reached the screen instead was
+ * fragments of generated ARM code.
+ *
+ * Forfeiting costs only the games that reach up there, which are the ones
+ * that cannot share it anyway; everything in mode 13h or text keeps the
+ * large arena.
+ */
+static bool nj_vga_arena_forfeited;
+
+void njit_vga_arena_forfeit(void)
+{
+    nj_vga_arena_forfeited = true;
+    njit_vga_arena_release();
+}
+
 void njit_vga_arena_rearm(void)
 {
+    if (nj_vga_arena_forfeited) return;
     /* Only a flag.  This can be called from the renderer or a port write, so
      * it must not touch the arena; nj_vga_arena_take() does that later, on
      * the compile path, where nothing is executing out of it. */
@@ -14275,6 +14299,7 @@ static int IRAM_ATTR nj_probe_existing(CPUI386 *cpu, int max_steps)
 void njit_vga_arena_offer(void *base, unsigned bytes) { (void)base; (void)bytes; }
 void njit_vga_arena_release(void) { }
 void njit_vga_arena_rearm(void) { }
+void njit_vga_arena_forfeit(void) { }
 
 #endif /* NATIVE_JIT */
 
