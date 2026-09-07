@@ -12277,8 +12277,36 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
          * Cyber Chess spent every one of its 317 compile attempts in twelve
          * seconds that way, for 0.0% native coverage.
          */
+/*
+ * A8, TEST AL,imm8 - OFF, because it freezes Bust-A-Move.
+ *
+ * The lowering itself is an AND that discards its result, byte for byte what
+ * opcode 24 already emits minus the write-back, and nj_v6_write_r8() is
+ * documented to leave r1-r3 exactly as the deferred flag record needs them.
+ * Reviewing it found nothing.  Hardware disagrees: with A8 on, the game hangs
+ * in a rectangular blit whose row count has become 12 724 instead of the 15
+ * its own stack frame carries, reproducibly at the sixth round of
+ * claude_handoff/bamstress.py, and with A8 off it survives eight.  Everything
+ * else in that build - OUT, RET on a 16-bit stack, the linked floor - is
+ * innocent by the same test.
+ *
+ * The likely mechanism is not the opcode but what it unlocks: A8 is what lets
+ * `in al,dx / test al,8 / jnz` compile at all, so with it the retrace wait
+ * loop runs natively for the first time.  The next thing to try is A8 on with
+ * NJIT_COMPILE_IN off, which separates the two.  That build was made and the
+ * board came up black before it could be measured, so the question is open.
+ *
+ * Turning it back on also gives Cyber Chess 1.949 -> 3.469 MIPS, which it
+ * only gets in combination with NJ_TRACE_MIN_INSNS_LINKED: its wait loop is
+ * three instructions, so decoding it is useless while the floor refuses the
+ * block.
+ */
+#ifndef NJIT_COMPILE_TEST_AL
+#define NJIT_COMPILE_TEST_AL 0
+#endif
         if (!done && (op==0x04 || op==0x0c || op==0x24 ||
-                      op==0x2c || op==0x34 || op==0x3c || op==0xa8)) {
+                      op==0x2c || op==0x34 || op==0x3c ||
+                      (NJIT_COMPILE_TEST_AL && op==0xa8))) {
             if (op_pos + 2u > avail) break;
             u8 imm=code[op_pos+1u];
             nj_v6_read_r8(&e,0); nj_mov_reg(&e,1,3);
