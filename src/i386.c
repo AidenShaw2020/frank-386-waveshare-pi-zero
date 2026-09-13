@@ -14667,6 +14667,15 @@ void njit_vga_arena_forfeit(void) { }
 
 #endif /* NATIVE_JIT */
 
+/*
+ * The diagnostic notes above live inside #if NATIVE_JIT, but call_isr()
+ * uses NJ_ISR_NOTE() unconditionally. Without the JIT the macro would be
+ * taken for a function and the link would fail, so give it a no-op form.
+ */
+#ifndef NJ_ISR_NOTE
+#define NJ_ISR_NOTE(why, w1v, w2v) do { } while (0)
+#endif
+
 static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 {
 #ifndef I386_OPT2
@@ -16149,11 +16158,13 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	 * the only point that is guaranteed to run after the memory test and
 	 * before the guest.
 	 */
+#if NJIT_EXIT_RING
 	{
 		volatile u32 *d_ = (volatile u32 *)(0x11000000u + 0x000a8000u);
 		for (unsigned k = NJ_V6_EXC; k <= NJ_V6_ISR_SEEN; k++)
 			d_[k] = 0u;
 	}
+#endif
 
 	CPUI386 *cpu = malloc(sizeof(CPUI386));
 	switch (gen) {
