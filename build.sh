@@ -242,9 +242,17 @@ if [[ $CLEAN -eq 1 ]] || [[ ! -d ./build ]]; then
 fi
 
 cd build
+# Where the pico-sdk tools live. Set PICO_SDK_ROOT to override.
+if [[ -z "$PICO_SDK_ROOT" ]]; then
+    if [[ -n "$USERPROFILE" ]]; then
+        PICO_SDK_ROOT="$(printf '%s' "$USERPROFILE" | tr '\\' '/')/.pico-sdk"
+    else
+        PICO_SDK_ROOT="$HOME/.pico-sdk"
+    fi
+fi
 CMAKE_ARGS+=(
-    "-Dpioasm_DIR=$HOME/.pico-sdk/tools/2.2.0/pioasm"
-    "-Dpicotool_DIR=$HOME/.pico-sdk/picotool/2.2.0-a4/picotool"
+    "-Dpioasm_DIR=$PICO_SDK_ROOT/tools/2.2.0/pioasm"
+    "-Dpicotool_DIR=$PICO_SDK_ROOT/picotool/2.2.0-a4/picotool"
 )
 cmake -G Ninja "${CMAKE_ARGS[@]}" ..
 cmake --build . --parallel 8
