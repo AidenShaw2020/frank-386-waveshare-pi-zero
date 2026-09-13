@@ -1836,7 +1836,49 @@ void __no_inline_not_in_flash_func(set_flash_timings)(int cpu_mhz, int cfg_flash
                         divisor << QMI_M0_TIMING_CLKDIV_LSB;
 }
 
+/*
+ * Non-zero once a boot has stepped down because the previous one browned
+ * out.  Readable over SWD so the reduced clock is never a silent surprise.
+ */
+/* Defined below, next to the frequency table it reads. */
+static enum vreg_voltage get_voltage_for_freq(int mhz);
+
+volatile uint32_t g_brownout_fallback __attribute__((used));
+
+/*
+ * How fast to run this boot.
+ *
+ * The board resets with POWMAN_CHIP_RESET reading HAD_BOR and an empty
+ * watchdog fault marker - a hardware brownout, the core rail collapsing
+ * below the 1.10 V detector threshold while the regulator is set to
+ * 1.65 V.  It is a power delivery limit, not a firmware fault, and the
+ * RP2350 regulator has no current limit to raise.  What firmware can do is
+ * stop demanding as much the next time round.
+ *
+ * POWMAN_CHIP_RESET names the *last* reset, so HAD_BOR here means the
+ * previous attempt died of it.  Come up at the lower clock and voltage
+ * instead, which is roughly 30% less dynamic power:
+ * (378/504) * (1.60/1.65)^2.  A board that would otherwise sit in a
+ * brownout loop then reaches DOS, slower but usable, and says so.
+ *
+ * A clean reset clears the bit, so the next ordinary boot is full speed
+ * again.  This is a safety net, not a cure - the cure is a supply that
+ * can deliver the transient.
+ */
+static int boot_cpu_mhz(void)
+{
+#if BROWNOUT_FALLBACK_MHZ
+    if (powman_hw->chip_reset & POWMAN_CHIP_RESET_HAD_BOR_BITS) {
+        g_brownout_fallback = BROWNOUT_FALLBACK_MHZ;
+        return BROWNOUT_FALLBACK_MHZ;
+    }
+#endif
+    g_brownout_fallback = 0;
+    return CPU_CLOCK_MHZ;
+}
+
 static void configure_clocks(void) {
+    const int boot_mhz = boot_cpu_mhz();
 #if CPU_CLOCK_MHZ > 252
     // Overclock: disable voltage limit and set higher voltage
     DBG_PRINT("Configuring overclock: %d MHz @ %s\n", CPU_CLOCK_MHZ,
@@ -1844,7 +1886,7 @@ static void configure_clocks(void) {
            CPU_CLOCK_MHZ >= 378 ? "1.60V" : "1.50V");
 
     vreg_disable_voltage_limit();
-    vreg_set_voltage(CPU_VOLTAGE);
+    vreg_set_voltage(get_voltage_for_freq(boot_mhz));
     sleep_ms(100);  // Stabilization delay
 
 #if NO_BOD
@@ -1867,11 +1909,11 @@ static void configure_clocks(void) {
 #endif
 
     // Configure flash timing BEFORE changing clock
-    set_flash_timings(CPU_CLOCK_MHZ, FLASH_MAX_FREQ_MHZ);
+    set_flash_timings(boot_mhz, FLASH_MAX_FREQ_MHZ);
 #endif
 
     // Set system clock
-    set_sys_clock_khz(CPU_CLOCK_MHZ * 1000, false);
+    set_sys_clock_khz(boot_mhz * 1000, false);
 
 #if PERI_CLOCK_MHZ
     /*
@@ -1900,6 +1942,20 @@ static void configure_clocks(void) {
 static enum vreg_voltage get_voltage_for_freq(int mhz) {
     int v = config_get_voltage();
     if (v >= 0) return (enum vreg_voltage)v;  /* user override */
+#ifdef CPU_VOLTAGE_FORCE
+    /*
+     * Diagnostic override, set from CMake.
+     *
+     * The board browns out with the core at 1.65 V while the RP2350's
+     * nominal is 1.10 V, so it is drawing roughly 2.25x the current the
+     * internal regulator is designed around.  Lowering the core voltage at
+     * the same clock separates "the internal regulator cannot supply this"
+     * from "something upstream of it is sagging": if the brownouts stop,
+     * the limit is the core rail, not the 5 V input.
+     */
+    (void) mhz;
+    return (enum vreg_voltage)(CPU_VOLTAGE_FORCE);
+#endif
     /* auto: safe defaults per frequency */
     if (mhz >= 504) return VREG_VOLTAGE_1_65;
     if (mhz >= 378) return VREG_VOLTAGE_1_60;
@@ -1987,6 +2043,33 @@ static bool init_hardware(void) {
     }
     g_diag_stage = DIAG_PSRAM_OK;
     DBG_PRINT("  PSRAM test passed (8MB)\n");
+
+    /*
+     * Let the supply recover before the biggest current step of the boot.
+     *
+     * The board resets with POWMAN_CHIP_RESET reading HAD_BOR and an empty
+     * watchdog fault marker - a hardware brownout, no software path - and
+     * when it does, g_diag_stage is stuck at DIAG_PSRAM_OK.  That pins the
+     * reset to exactly this point: between the PSRAM test finishing and
+     * DIAG_SD_BEGIN there is nothing but the core 1 launch and the VGA/DVI
+     * bring-up that follows it.  A second Cortex-M33 starts executing at
+     * the full overclock and the PIO serialisers and their DMA start
+     * driving the display, all in the microseconds after psram_test() has
+     * just finished thrashing memory.
+     *
+     * Measured on the live board: POWMAN_VREG VSEL is 20 (1.65 V) and
+     * POWMAN_BOD VSEL is 11 (1.10 V, the reset default) with EN set.  For
+     * the detector to fire, the core rail really does collapse by a third,
+     * so this is a power delivery limit and not a mis-set threshold.  The
+     * regulator has no programmable current limit on RP2350, and NO_BOD is
+     * not an option - disabling the detector only stops the chip reacting
+     * to a dip while it writes to an SD card.
+     *
+     * All firmware can do is stop stacking the transients.  This is not a
+     * cure for a marginal cable or hub; it buys the bulk capacitance time
+     * to recharge so the two bursts are not drawn as one.
+     */
+    sleep_ms(BOOT_SETTLE_MS);
 
     // Initialize VGA early so we can show errors on screen
     multicore_launch_core1(core1_entry);
@@ -2338,8 +2421,14 @@ static void __not_in_flash_func(core1_entry)(void) {
         __dmb();
     }
     static repeating_timer_t m_timer = { 0 };
-    int hz = 44100;
-    add_repeating_timer_us(-1000000 / hz, timer_callback0, pc, &m_timer);
+    /* The period is the audio clock: timer_callback() emits exactly one
+     * stereo frame per call, so the output rate is 1e6/period and nothing
+     * else.  It is spelled out here rather than computed from a wished-for
+     * 44100, because -1000000/44100 truncates to -22 us and the result was
+     * a 3.07% mismatch against the PIO divider that the frame ring paid for
+     * at 1354 dropped frames a second.  SOUND_FREQUENCY is derived from
+     * this number in CMakeLists.txt; keep them together. */
+    add_repeating_timer_us(-AUDIO_TIMER_PERIOD_US, timer_callback0, pc, &m_timer);
     njt_arm();          /* core 1 has its own cycle counter */
 #if ADLIB_CORE1
     g_adlib_pump_pc = pc;

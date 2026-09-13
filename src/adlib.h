@@ -36,7 +36,9 @@
  * samples, and chasing a fixed lead ahead of the consumer's own position is
  * exactly what guarantees that.
  */
-#define ADLIB_LEAD_SAMPLES  224
+#ifndef ADLIB_LEAD_SAMPLES
+#define ADLIB_LEAD_SAMPLES  224u
+#endif
 
 /* Output samples per call into the emu8950 renderer.  It lives in flash, so
  * every entry evicts XIP lines the interpreter is using and the call is worth
@@ -77,11 +79,17 @@
  * costs core 0 about 13% more OPL work instead, roughly 1% of core 0, and
  * leaves the audio ISR exactly where it was.
  *
- * Q16 step: 49716 * 65536 / 44100 = 73882.3, so 73882 is 3 ppm slow.
+ * Q16 step: 49716 * 65536 / SOUND_FREQUENCY, rounded.  At the old nominal
+ * 44100 that was 73882; at the output's true 45455 Hz it is 71679.  The
+ * divisor has to be the rate the frames are actually played at, which is
+ * set by the audio timer period - see AUDIO_TIMER_PERIOD_US.
  */
-#define ADLIB_RS_STEP  73882u
+#define ADLIB_RS_STEP  ((uint32_t)((49716ull * 65536u + SOUND_FREQUENCY / 2u) \
+                                   / (unsigned)SOUND_FREQUENCY))
 
-/* Chip samples one render pass can consume: (0xffff + 32 * STEP) >> 16. */
+/* Chip samples one render pass can consume: (0xffff + 32 * STEP) >> 16.
+ * 38 covers the old 44100 step; a higher output rate only makes STEP
+ * smaller, so it stays an upper bound. */
 #define ADLIB_RS_MAX   38
 
 /*
@@ -108,7 +116,9 @@
  * the interpreter back control roughly every 90 us instead of disappearing
  * into one long render.
  */
-#define ADLIB_NBUF 4
+#ifndef ADLIB_NBUF
+#define ADLIB_NBUF 4u
+#endif
 
 typedef struct AdlibState AdlibState;
 

@@ -64,6 +64,15 @@ void audio_set_volume(uint8_t);
 uint8_t audio_get_volume(void);
 void audio_init(void);
 
+/* The rate frames actually leave the board at, in Hz.
+ *
+ * SOUND_FREQUENCY is a compile definition, so nothing outside the build
+ * can see it - and every tool that guessed 44100 instead guessed wrong for
+ * as long as the timer period and the PIO divider disagreed.  Exporting it
+ * costs four bytes of flash and lets the host tests and the SWD diagnostics
+ * read the number rather than assume it. */
+extern const volatile uint32_t g_audio_out_hz;
+
 #ifdef __cplusplus
 }
 #endif

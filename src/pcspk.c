@@ -33,9 +33,22 @@ void *pcmalloc(long size);
 #define pcmalloc malloc
 #endif
 
-#define PCSPK_BUF_LEN 4096
+/*
+ * The looping square-wave buffer behind pcspk_callback().
+ *
+ * That callback is the QEMU mixer path and nothing on this port calls it:
+ * the RP2350 audio side asks pcspk_sample() for one sample at a time and
+ * derives it from the PIT directly.  The buffer was still 4 KB, taken from
+ * a malloc heap that ends up with about 4 KB left in it - so pcspk_init()
+ * was the allocation that failed, and the whole board came up as a black
+ * screen with "Out of memory" on a console nobody watches.  Keeping it
+ * small leaves that headroom for the devices that actually need it.
+ */
+#define PCSPK_BUF_LEN 256
 //#define PCSPK_SAMPLE_RATE 32000
-#define PCSPK_SAMPLE_RATE 44100
+/* The PC speaker is sampled by the same one-frame-per-call timer as
+ * everything else, so its rate is the output rate, not a nominal 44100. */
+#define PCSPK_SAMPLE_RATE SOUND_FREQUENCY
 #define PCSPK_MAX_FREQ (PCSPK_SAMPLE_RATE >> 1)
 #define PCSPK_MIN_COUNT ((PIT_FREQ + PCSPK_MAX_FREQ - 1) / PCSPK_MAX_FREQ)
 

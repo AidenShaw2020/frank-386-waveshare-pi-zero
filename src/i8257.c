@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 #include "i8257.h"
+#include <pico/time.h>
 #include "audiodiag.h"
 #include <stdbool.h>
 #include <stdio.h>
@@ -160,10 +161,44 @@ uint64_t i8257_read_chan(void *opaque, hwaddr nport, unsigned size)
 
     dir = ((r->mode >> 5) & 1) ? -1 : 1;
     ff = i8257_getff(d);
-    if (nreg)
-        val = (r->base[COUNT] << d->dshift) - r->now[COUNT];
-    else
+    if (nreg) {
+        int now = r->now[COUNT];
+#if I8257_COUNT_IS_PLAY_POS
+        /*
+         * Report where playback is, not where the transfer is.
+         *
+         * now[COUNT] advances when a chunk is handed to the device, and the
+         * device then sits on it: the Sound Blaster keeps up to
+         * sb16_lead_bytes() queued ahead of the DAC.  A guest that reads
+         * this register to find the play cursor is therefore told that more
+         * has been played than really has, by the whole lead.
+         *
+         * Teenagent's mixer at CS:04e2 does exactly that: it reads the count
+         * into BX, refuses to mix when BX <= 100 so as not to overwrite what
+         * the card is about to clock out, and otherwise writes into the live
+         * DMA region.  Measured on the board, this count advances in steps of
+         * 20 to 88 bytes and the lead is 88 - so the error very nearly
+         * cancels the 100-byte guard the guest relies on, and it mixes over
+         * audio we have already queued.  That lands mid-sound as a click, and
+         * only while the guest is actually mixing, which is why one music
+         * track crackles and a sparser one does not.
+         *
+         * Subtracting what the owner still holds hands the guest the cursor
+         * it thinks it is reading, and makes its own guard mean what it says.
+         */
+        if (r->queued_handler) {
+            int queued = r->queued_handler(r->opaque,
+                                           ichan + (d->dshift ? 4 : 0));
+            if (queued > 0) {
+                now -= queued;
+                if (now < 0) now = 0;
+            }
+        }
+#endif
+        val = (r->base[COUNT] << d->dshift) - now;
+    } else {
         val = r->now[ADDR] + r->now[COUNT] * dir;
+    }
 
     ldebug ("read_chan %#x -> %d\n", iport, val);
     return (val >> (d->dshift + (ff << 3))) & 0xff;
@@ -280,6 +315,41 @@ void i8257_write_cont(void *opaque, hwaddr nport, uint64_t data,
 #endif
 }
 
+/*
+ * The DMA controller's side of the Sound Blaster handshake, in PSRAM.
+ *
+ * Sierra's SNDBLAST.DRV does not hook an interrupt to decide whether the
+ * card is real: it programs channel 1, sends the DSP a one-byte block,
+ * waits about four milliseconds and reads the status register at 0x08
+ * looking for channel 1's terminal-count bit.  Whether that bit is set at
+ * the moment of that read is the whole test, and it is invisible from
+ * outside - hence these slots, on the same page as the SB diagnostics.
+ */
+#define DMA_DIAG ((volatile uint32_t *)(0x11000000u + 0x000aa000u))
+#define DMA_DIAG_STATRD 136   /* reads of the status register */
+#define DMA_DIAG_STATV  137   /* 137..144: the last eight values returned */
+#define DMA_DIAG_TC     145   /* terminal counts recorded */
+#define DMA_DIAG_RUN    146   /* channel runs */
+#define DMA_DIAG_LASTN  147   /* what the handler last returned */
+#define DMA_DIAG_LASTL  148   /* the length it was measured against */
+#define DMA_DIAG_MASK   149   /* channel mask at the last status read */
+#define DMA_DIAG_TCUS   150   /* when the terminal count was last set */
+#define DMA_DIAG_SRING  160   /* 160..223: 32 x (time_us, value) */
+#define DMA_DIAG_SRING_N 32u
+#define DMA_DIAG_RRING  224   /* 224..319: 32 x (cs, ip, value) */
+#define DMA_DIAG_IRING  320   /* 320..351: which controller instance */
+
+/* Called from the machine's port decoder, which is where the CPU state is
+ * reachable; see the note at the status register above. */
+void i8257_diag_note_reader(uint32_t cs, uint32_t ip, uint32_t val)
+{
+    const uint32_t k = DMA_DIAG[DMA_DIAG_STATRD];
+    const uint32_t i = DMA_DIAG_RRING + 3u * ((k - 1u) % DMA_DIAG_SRING_N);
+    DMA_DIAG[i] = cs;
+    DMA_DIAG[i + 1u] = ip;
+    DMA_DIAG[i + 2u] = 0x100u | (val & 0xffu);
+}
+
 uint64_t i8257_read_cont(void *opaque, hwaddr nport, unsigned size)
 {
     I8257State *d = opaque;
@@ -289,6 +359,18 @@ uint64_t i8257_read_cont(void *opaque, hwaddr nport, unsigned size)
     switch (iport) {
     case 0x00:                  /* status */
         val = d->status;
+        {
+            const uint32_t k = DMA_DIAG[DMA_DIAG_STATRD];
+            DMA_DIAG[DMA_DIAG_STATV + (k & 7u)] = 0x100u | (uint32_t)val;
+            DMA_DIAG[DMA_DIAG_SRING + 2u * (k % DMA_DIAG_SRING_N)] =
+                time_us_32();
+            DMA_DIAG[DMA_DIAG_SRING + 2u * (k % DMA_DIAG_SRING_N) + 1u] =
+                0x100u | (uint32_t)val;
+            DMA_DIAG[DMA_DIAG_IRING + (k % DMA_DIAG_SRING_N)] =
+                (uint32_t)(uintptr_t)d;
+            DMA_DIAG[DMA_DIAG_STATRD] = k + 1u;
+        }
+        DMA_DIAG[DMA_DIAG_MASK] = d->mask;
         d->status &= 0xf0;
         break;
     case 0x01:                  /* mask */
@@ -351,9 +433,22 @@ static void __not_in_flash_func(i8257_channel_run)(I8257State *d, int ichan)
                              r->now[COUNT], (r->base[COUNT] + 1) << ncont);
     r->now[COUNT] = n;
     ldebug ("dma_pos %d size %d\n", n, (r->base[COUNT] + 1) << ncont);
+    DMA_DIAG[DMA_DIAG_RUN]++;
+    DMA_DIAG[DMA_DIAG_LASTN] = (uint32_t)n;
+    DMA_DIAG[DMA_DIAG_LASTL] = (uint32_t)((r->base[COUNT] + 1) << ncont);
     if (n == (r->base[COUNT] + 1) << ncont) {
         ldebug("transfer done\n");
         d->status |= (1 << ichan);
+        DMA_DIAG[DMA_DIAG_TC]++;
+        DMA_DIAG[DMA_DIAG_TCUS] = time_us_32();
+        /* 8237 auto-initialization reloads both current registers at TC,
+         * even if the peripheral deasserted DREQ (single-cycle SB DSP).
+         * Leaving now[COUNT] at length exposes FFFF until the next refill;
+         * drivers such as Teenagent use that count to mix into live DMA RAM.
+         */
+        if (r->mode & 0x10) {
+            i8257_init_chan(d, ichan);
+        }
     }
 }
 
@@ -401,7 +496,17 @@ void i8257_dma_register_channel(IsaDma *obj, int nchan,
 
     r = d->regs + ichan;
     r->transfer_handler = transfer_handler;
+    r->queued_handler = NULL;
     r->opaque = opaque;
+}
+
+/* Optional: let a channel's owner say how much it is still holding, so the
+ * count register can report the play position.  See i8257_read_chan(). */
+void i8257_dma_set_queued_handler(IsaDma *obj, int nchan,
+                                  IsaDmaQueuedHandler queued_handler)
+{
+    I8257State *d = I8257(obj);
+    d->regs[nchan & 3].queued_handler = queued_handler;
 }
 
 static bool i8257_is_verify_transfer(I8257Regs *r)
@@ -648,6 +753,7 @@ static void i8257_realize(DeviceState *dev, Error **errp)
 
     for (i = 0; i < ARRAY_SIZE(d->regs); ++i) {
         d->regs[i].transfer_handler = i8257_phony_handler;
+        d->regs[i].queued_handler = NULL;
     }
 
     d->dma_bh = qemu_bh_new(i8257_dma_run, d);
@@ -761,6 +867,7 @@ I8257State *i8257_new(
 
     for (i = 0; i < 4 /* ARRAY_SIZE(d->regs) */; ++i) {
         d->regs[i].transfer_handler = i8257_phony_handler;
+        d->regs[i].queued_handler = NULL;
     }
 
 //    d->dma_bh = qemu_bh_new(i8257_dma_run, d);
