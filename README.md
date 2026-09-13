@@ -372,7 +372,21 @@ Set `redirector = 1` in config.ini.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+The project's own code is under the MIT License. See [LICENSE](LICENSE) for
+the full text and for the third-party notices.
+
+Note that the **combined firmware binary is not MIT-only**. It links code under
+several licenses, and the strongest of them governs the whole image:
+
+- `drivers/ps2/` is `GPL-2.0-or-later` (derived from QuakeGeneric), so a
+  distributed binary built with the PS/2 driver is a derivative work under
+  GPL-2.0-or-later, and anyone who receives that binary is entitled to the
+  corresponding source under those terms.
+- The AdLib FM generator (fmopl, from MAME) is `LGPL-2.1-or-later`, and SeaBIOS
+  is `LGPL-3.0`.
+
+This is inherited from upstream frank-386 and is recorded here so that anyone
+redistributing a build knows which obligations actually apply.
 
 ## Authors & Contributors
 
