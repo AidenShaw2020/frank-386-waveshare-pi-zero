@@ -20,6 +20,8 @@ python -m venv .venv-jit
 .venv-jit/Scripts/python tests/jit/run_link.py build/z0p2-386-504MHz-P166-I2S-v1.05.elf
 .venv-jit/Scripts/python tests/jit/run_vga.py build/z0p2-386-504MHz-P166-I2S-v1.05.elf
 .venv-jit/Scripts/python tests/jit/run_seg.py build/z0p2-386-504MHz-P166-I2S-v1.05.elf
+# Requires a firmware configured with -DNJIT_REP_MOVSB=ON.
+.venv-jit/Scripts/python tests/jit/run_rep.py build/z0p2-386-504MHz-P166-I2S-v1.05.elf
 ```
 
 Two more tools report on the compiler rather than testing it. They need
@@ -81,6 +83,10 @@ the updated partial-register writers must pass.
   re-run against the base the write invalidated. That last case was verified
   against the bug - remove the `seg_write_at` condition in
   `nj_compile_v6_trace()` and it fails.
+- `run_rep.py` - `REP MOVSB` in the supported code/address-size combinations,
+  including DF, zero count, preservation of the high register halves for a
+  16-bit address size, and overlapping copies whose byte-by-byte x86 semantics
+  deliberately differ from libc `memmove`.
 - `coverage_matrix.py` - which of 77 common x86 forms the compiler admits, in
   16- and 32-bit mode, with the emitted bytes per guest instruction. Reports
   admission, not correctness.

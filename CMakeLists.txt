@@ -250,13 +250,105 @@ target_include_directories(audio_driver PUBLIC drivers/audio src)
 target_compile_definitions(audio_driver PRIVATE
     BOARD_${BOARD}
 )
+#
+# The audio output rate is whatever the timer period actually is.
+#
+# timer_callback() produces exactly one stereo frame per call and the frame
+# ring hands those to the I2S DMA, so the production rate is 1e6 / the timer
+# period in microseconds - nothing else.  add_repeating_timer_us() takes whole
+# microseconds, so asking for 44100 Hz gave -1000000/44100 = -22 us, i.e.
+# 45454.545 frames per second: 3.07% above the 44100 Hz the PIO divider was
+# set to and every resampler in the tree was stepping towards.
+#
+# The ring absorbed the difference by dropping frames.  Measured 1354.30 skips
+# per second against 45454.545 - 44100.07 = 1354.48 predicted, which is all of
+# it.  Each drop is a 22.7 us discontinuity and they land every 0.74 ms, so
+# they are audible as a continuous crackle that tracks programme level; the
+# same 3.07% overspeed also drains the Sound Blaster's DMA buffer faster than
+# the guest refills it.
+#
+# The fix is to let the timer define the rate instead of contradicting it.
+# At 504 MHz, sample_freq 45455 makes i2s_init()'s 8.8 divider come out at
+# exactly 44352, and 2016000000/44352 is exactly 1000000/22 - the PIO then
+# consumes at precisely the rate the timer produces.
+#
+# This is NOT the rejected 49716 Hz experiment described in adlib.h.  That one
+# raised the mixer callback rate on core 1 by 12.7% and the board came up
+# black.  The timer period here is untouched at 22 us, so core 1 does exactly
+# as much work per second as before; only the PIO clock divider moves.
+#
+# Set this OFF to rebuild the old mismatched behaviour for an A/B.
+# Report the DMA count register as the play position rather than the
+# transfer position.  See the long comment in src/i8257.c.  Default OFF:
+# it is well evidenced but nobody has heard it yet, and this is the exact
+# area where four earlier patches were rejected on listening.
+option(I8257_COUNT_IS_PLAY_POS "DMA count register reports the play cursor" OFF)
+if(I8257_COUNT_IS_PLAY_POS)
+    set(I8257_COUNT_IS_PLAY_POS_VAL 1)
+else()
+    set(I8257_COUNT_IS_PLAY_POS_VAL 0)
+endif()
+
+# If the previous boot died of a brownout, come up at this clock instead of
+# CPU_SPEED so the board reaches DOS rather than looping.  0 disables it.
+# See boot_cpu_mhz() in src/main.c.
+# Diagnostic: force a core voltage regardless of clock.  Empty means the
+# usual table in get_voltage_for_freq().  See the comment there.
+set(CPU_VOLTAGE_FORCE "" CACHE STRING "Force a vreg_voltage enum value, e.g. VREG_VOLTAGE_1_60")
+if(NOT CPU_VOLTAGE_FORCE STREQUAL "")
+    add_compile_definitions(CPU_VOLTAGE_FORCE=${CPU_VOLTAGE_FORCE})
+endif()
+
+set(BROWNOUT_FALLBACK_MHZ 378 CACHE STRING "Clock to fall back to after a brownout reset, MHz; 0 to disable")
+
+# Settling time before the core 1 launch, the boot's largest current step.
+# See the long comment at its use in src/main.c.
+set(BOOT_SETTLE_MS 150 CACHE STRING "Supply settling delay before launching core 1, ms")
+
+# Decode the SB PCM frame the read pointer is on, then advance - see the
+# long comment at the guard in src/sb16.c.  Separate from the rate option
+# so the two can be heard apart.
+# Default ON: run_sb_pcm.py goes 16/16 with it and fails on the first case
+# without it, so this is the correct consumer order, not a preference.  The
+# audible result is UNCONFIRMED - nobody has heard it - so OFF restores the
+# old behaviour exactly if it turns out to be wrong.
+option(SB16_DECODE_BEFORE_ADVANCE "Decode the SB PCM frame before advancing the read pointer" ON)
+if(SB16_DECODE_BEFORE_ADVANCE)
+    set(SB16_DECODE_BEFORE_ADVANCE_VAL 1)
+else()
+    set(SB16_DECODE_BEFORE_ADVANCE_VAL 0)
+endif()
+
+# Turn off the emu8950 shortcuts that trade synthesis accuracy for speed:
+# the simplified noise generator, the short noise update check, the muted
+# slot skip and the end-of-note early exit.  None of them has ever been
+# checked by ear, and the user describes the artefact as an instrument
+# dropping out - which is the shape a wrongly taken shortcut would have.
+# ON here means accurate, so the shortcuts are compiled as 0.
+option(EMU8950_ACCURATE "Disable the emu8950 speed shortcuts" OFF)
+if(EMU8950_ACCURATE)
+    set(EMU8950_ACCURATE_INV 0)
+else()
+    set(EMU8950_ACCURATE_INV 1)
+endif()
+
+option(AUDIO_RATE_MATCHES_TIMER "Clock the I2S output at the audio timer's true rate" ON)
+set(AUDIO_TIMER_PERIOD_US 22 CACHE STRING "Audio timer period in microseconds")
+if(AUDIO_RATE_MATCHES_TIMER)
+    # round(1000000 / 22)
+    set(FRANK_SOUND_FREQUENCY 45455)
+else()
+    set(FRANK_SOUND_FREQUENCY 44100)
+endif()
+message(STATUS "Audio: timer period ${AUDIO_TIMER_PERIOD_US} us, SOUND_FREQUENCY ${FRANK_SOUND_FREQUENCY}")
+
 pico_generate_pio_header(audio_driver ${CMAKE_CURRENT_LIST_DIR}/drivers/audio/audio_i2s.pio)
 if(AUDIO_TYPE STREQUAL "I2S")
     target_link_libraries(audio_driver pico_stdlib hardware_dma hardware_pio hardware_clocks hardware_sync hardware_irq)
-    target_compile_definitions(audio_driver PRIVATE FEATURE_AUDIO_I2S=1 SOUND_FREQUENCY=44100)
+    target_compile_definitions(audio_driver PRIVATE FEATURE_AUDIO_I2S=1 SOUND_FREQUENCY=${FRANK_SOUND_FREQUENCY})
 elseif(AUDIO_TYPE STREQUAL "PWM")
     target_link_libraries(audio_driver pico_stdlib hardware_dma hardware_pio hardware_clocks hardware_sync hardware_irq hardware_pwm)
-    target_compile_definitions(audio_driver PRIVATE FEATURE_AUDIO_PWM=1 SOUND_FREQUENCY=44100)
+    target_compile_definitions(audio_driver PRIVATE FEATURE_AUDIO_PWM=1 SOUND_FREQUENCY=${FRANK_SOUND_FREQUENCY})
 endif()
 
 #=============================================================================
@@ -404,7 +496,12 @@ target_compile_definitions(${BUILD_NAME} PRIVATE
     # Performance optimizations
     I386_ENABLE_INLINE=1
 
-    SOUND_FREQUENCY=44100
+    SOUND_FREQUENCY=${FRANK_SOUND_FREQUENCY}
+    AUDIO_TIMER_PERIOD_US=${AUDIO_TIMER_PERIOD_US}
+    SB16_DECODE_BEFORE_ADVANCE=${SB16_DECODE_BEFORE_ADVANCE_VAL}
+    BOOT_SETTLE_MS=${BOOT_SETTLE_MS}
+    BROWNOUT_FALLBACK_MHZ=${BROWNOUT_FALLBACK_MHZ}
+    I8257_COUNT_IS_PLAY_POS=${I8257_COUNT_IS_PLAY_POS_VAL}
 
     # OPL2
     USE_EMU8950_OPL
@@ -415,10 +512,10 @@ target_compile_definitions(${BUILD_NAME} PRIVATE
     EMU8950_NO_FLOAT=1
     EMU8950_NO_TIMER=1
     EMU8950_NO_TEST_FLAG=1
-    EMU8950_SIMPLER_NOISE=1
-    EMU8950_SHORT_NOISE_UPDATE_CHECK=1
-    EMU8950_LINEAR_SKIP=1
-    EMU8950_LINEAR_END_OF_NOTE_OPTIMIZATION
+    EMU8950_SIMPLER_NOISE=${EMU8950_ACCURATE_INV}
+    EMU8950_SHORT_NOISE_UPDATE_CHECK=${EMU8950_ACCURATE_INV}
+    EMU8950_LINEAR_SKIP=${EMU8950_ACCURATE_INV}
+    EMU8950_LINEAR_END_OF_NOTE_OPTIMIZATION=${EMU8950_ACCURATE_INV}
     EMU8950_NO_PERCUSSION_MODE=1
     EMU8950_LINEAR=1
 )
@@ -560,6 +657,13 @@ option(FRANK_NO_ADLIB "Skip the periodic AdLib refill (measurement build)" OFF)
 # OPL synthesis on core 1, in the gap where it waits for the I2S DMA.
 # See FRANK_ADLIB_CORE1 in src/adlib.c.
 option(ADLIB_CORE1 "Synthesise the OPL on core 1" OFF)
+set(ADLIB_RING_NBUF "4" CACHE STRING
+    "Number of 64-sample batches in the OPL output ring (power of two)")
+set(ADLIB_RING_LEAD "224" CACHE STRING
+    "Number of OPL samples rendered ahead of the I2S consumer")
+target_compile_definitions(${BUILD_NAME} PRIVATE
+                           ADLIB_NBUF=${ADLIB_RING_NBUF}u
+                           ADLIB_LEAD_SAMPLES=${ADLIB_RING_LEAD}u)
 if(ADLIB_CORE1)
     # The synthesis runs as the I2S driver's idle hook, inside the wait for
     # the frame in flight.  A PWM board never calls repeat_me_often() into
@@ -588,14 +692,40 @@ if(NJIT_HOT_COUNTERS)
                                NJ_HOT_CTR_BITS=${NJIT_HOT_CTR_BITS}u)
 endif()
 target_compile_definitions(${BUILD_NAME} PRIVATE
-                           NJ_HOT_BITS=${NJIT_HOT_BITS}u
                            NJ_DISCOVERY_MASK=${NJIT_DISCOVERY_MASK}u
                            NJ_HOT_THRESHOLD=${NJIT_HOT_THRESHOLD}u)
 
 option(NJIT_BIG_CACHE "Native JIT: 64-block cache and 64-slot hot table" OFF)
-if(NJIT_BIG_CACHE)
+
+# 128 blocks and a 128-slot hot table.  Tyrian 2000 takes some 306000 backedges
+# a second against a few thousand block entries, so the cache is what bounds
+# its native coverage; this is the next step up and costs about 6.6 KB of SRAM
+# on top of NJIT_BIG_CACHE, which the heap may not have.
+option(NJIT_HUGE_CACHE "Native JIT: 128-block cache and 128-slot hot table" OFF)
+if(NJIT_HUGE_CACHE)
+    target_compile_definitions(${BUILD_NAME} PRIVATE
+                               NJ_CACHE_SET_BITS=6u NJ_HOT_BITS=7u)
+elseif(NJIT_BIG_CACHE)
     target_compile_definitions(${BUILD_NAME} PRIVATE
                                NJ_CACHE_SET_BITS=5u NJ_HOT_BITS=6u)
+else()
+    target_compile_definitions(${BUILD_NAME} PRIVATE
+                               NJ_HOT_BITS=${NJIT_HOT_BITS}u)
+endif()
+
+# Compile F3 A4 (REP MOVSB) through the native trace helper.  Kept switchable
+# because its value is workload-dependent and must be compared on real HW.
+option(NJIT_REP_MOVSB "Native JIT: compile REP MOVSB" OFF)
+if(NJIT_REP_MOVSB)
+    target_compile_definitions(${BUILD_NAME} PRIVATE NJIT_REP_MOVSB=1)
+endif()
+
+# Guest CS:EIP/physical-address sampling in cpui386_step().  Useful for hangs,
+# but it performs a guest translation every sixteen calls and must stay out of
+# performance builds.
+option(GUEST_PC_DIAG "Sample guest PC into the PSRAM diagnostic ring" OFF)
+if(GUEST_PC_DIAG)
+    target_compile_definitions(${BUILD_NAME} PRIVATE GUEST_PC_DIAG=1)
 endif()
 
 # Per-entry diagnostics in the JIT tables, for the profiler hotkeys. Costs

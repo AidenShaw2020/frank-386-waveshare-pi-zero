@@ -34,3 +34,4 @@ v*-to-v*.diff
 SHA256SUMS*.txt
 *.patch
 fix-z2-hdmi.ps1
+*.pre-rate

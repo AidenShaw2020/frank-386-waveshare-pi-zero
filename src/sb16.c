@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "i8257.h"
+#include "i8259.h"
 #include <hardware/sync.h>
 
 /*
@@ -43,39 +44,96 @@
  * is how detection starts.  They live in the PSRAM diagnostic block, so they
  * cost no SRAM and nothing on any path that does not touch 0x22x.
  */
-#define SB_DIAG ((volatile uint32_t *)(0x11000000u + 0x000a8000u))
-#define SB_DIAG_WRITES 924
-#define SB_DIAG_RESETS 925
-#define SB_DIAG_READS  926
-#define SB_DIAG_LASTCMD 927
+/*
+ * The Sound Blaster diagnostics get a page of their own.
+ *
+ * They used to sit in NJ_V6_STOP's page at 0xa8000 at slots 924..1051, and
+ * everything from slot 1024 up is 0xa9000 - which is the JIT's block-exit
+ * ring.  The DMA and interrupt counters were therefore reading the JIT's
+ * data, which is how "SB_read_DMA entered 1, dma_cmd issued 3, IRQs raised
+ * 1" came to look like a plausible measurement of a card that had in fact
+ * done something else entirely.  0xaa000 is empty and 128 slots is far more
+ * than this needs.
+ */
+#define SB_DIAG ((volatile uint32_t *)(0x11000000u + 0x000aa000u))
+#define SB_DIAG_WRITES 0
+#define SB_DIAG_RESETS 1
+#define SB_DIAG_READS 2
+#define SB_DIAG_LASTCMD 3
 /* 928..943: writes by port offset, 944..959: reads by port offset.  A poll
  * loop is invisible in a single "last command" but obvious as soon as the
  * offsets it hammers are counted separately. */
-#define SB_DIAG_WPORT  928
-#define SB_DIAG_RPORT  944
-#define SB_DIAG_DACFREQ 960
-#define SB_DIAG_TIMECONST 961
-#define SB_DIAG_DACSAMP 962
-#define SB_DIAG_DACDROP 963
+#define SB_DIAG_WPORT 4
+#define SB_DIAG_RPORT 20
+#define SB_DIAG_DACFREQ 36
+#define SB_DIAG_TIMECONST 37
+#define SB_DIAG_DACSAMP 38
+#define SB_DIAG_DACDROP 39
 /*
  * The DSP conversation in order, for the host tools.  Totals say the guest
  * talked to the card; only the order says where a handshake went wrong, and
  * Sierra's SNDBLAST.DRV gives up after ten writes with no message beyond
  * "Unable to initialize your music hardware."
  */
-#define SB_RING_HEAD 1000
-#define SB_RING      1008      /* 1008..1039: port<<16 | val<<8 | isread */
-#define SB_RING_N    32
+/*
+ * The DSP conversation from the moment the host arms it, not the last few
+ * events before it was read.  A driver that gives up carries on doing
+ * nothing, so a wrap-around ring holds only silence; what decides the
+ * failure is the opening handshake.  Zero the head from the probe just
+ * before launching, and recording stops when the ring is full.
+ */
+#define SB_RING_HEAD 872
+#define SB_RING      880     /* 880..1007: port<<16 | val<<8 | isread */
+#define SB_RING_N    128
 /* Did the DMA engine ever call us, and did we ever ask it to? */
-#define SB_DIAG_DMACB   1040   /* SB_read_DMA entered */
-#define SB_DIAG_DMACMD  1041   /* dma_cmd8/dma_cmd issued */
-#define SB_DIAG_IRQ     1042   /* interrupts raised */
-#define SB_DIAG_HOLD    1043   /* last dma_running value */
+#define SB_DIAG_DMACB 116   /* SB_read_DMA entered */
+#define SB_DIAG_DMACMD 117   /* dma_cmd8/dma_cmd issued */
+#define SB_DIAG_IRQ 118   /* interrupts raised */
+#define SB_DIAG_HOLD 119   /* last dma_running value */
+/* Where the block-completion interrupt actually went, and what the PIC did
+ * with it.  Reading the guest's own interrupt vector at the moment of the
+ * raise is the only way to tell "the driver had not hooked yet" from "the
+ * driver had hooked and the interrupt never reached it". */
+#define SB_DIAG_IVT5 120   /* guest IVT[0x0d] when the block IRQ fired */
+#define SB_DIAG_IRQUS 121   /* how long the block was held back, us */
+#define SB_DIAG_ACKS 122   /* reads of base+0x0e after that raise */
+#define SB_DIAG_PICPRE 123   /* master PIC before the raise */
+#define SB_DIAG_PICPOST 124   /* master PIC after it */
+#define SB_DIAG_PICNOW 125   /* master PIC, refreshed from sb16_poll() */
+#define SB_DIAG_CMDUS 126   /* us from the 0x14 command to the raise */
+#define SB_DIAG_BLKIRQ 127   /* block-completion raises */
+/* IRQ 0..7's vectors (INT 08h..0Fh) as they stood at that instant: which
+ * one, if any, the driver had actually hooked. */
+#define SB_DIAG_IVT     128   /* 128..135 */
+/*
+ * The DSP version the card reports to command 0xe1, overridable from a debug
+ * probe so a driver that refuses one can be tried against another without a
+ * reflash.  Zero means the built-in value.
+ */
+#define SB_DIAG_VER     152
+/*
+ * The interrupt line the card is wired to, overridable from a debug probe.
+ *
+ * The board is an SB16, whose factory line is IRQ 5, and mixer register 0x80
+ * advertises that correctly - a guest that programs 0x80 moves the card and
+ * this emulator follows it.  What this slot is for is the other direction:
+ * several games end up believing the card is on IRQ 7, which is the original
+ * Sound Blaster's factory line and the fallback a failed autodetection lands
+ * on, and the only way to tell "the game wants 7" from "the game never saw 5"
+ * is to try both against the same game.  PSRAM survives a reset, so a poke
+ * plus a reset is a whole experiment with no reflash.  Zero means IRQ 5.
+ *
+ * Whatever is set here has to match the I- field of BLASTER in autoexec.bat,
+ * or a driver that reads the environment goes one way and the card the other.
+ */
+#define SB_DIAG_IRQ_SEL 153
+
 static inline void sb_ring_note(unsigned port, unsigned val, unsigned isread)
 {
-    const uint32_t h = SB_DIAG[SB_RING_HEAD] % SB_RING_N;
+    const uint32_t h = SB_DIAG[SB_RING_HEAD];
+    if (h >= SB_RING_N) return;
     SB_DIAG[SB_RING + h] = (port << 16) | ((val & 0xffu) << 8) | isread;
-    SB_DIAG[SB_RING_HEAD]++;
+    SB_DIAG[SB_RING_HEAD] = h + 1u;
 }
 
 
@@ -130,6 +188,17 @@ struct SB16State {
     int fmt_bits;
     AudioFormat fmt;
     int dma_auto;
+    /*
+     * Creative ADPCM.  bits is 0 (linear PCM), 4, 3 for the 2.6-bit scheme,
+     * or 2; next_* arm the mode for the dma_cmd8() that follows, so every
+     * ordinary transfer clears it without each call site having to.
+     */
+    int adpcm_bits;
+    int adpcm_haveref;
+    int adpcm_next_bits;
+    int adpcm_next_ref;
+    uint8_t adpcm_ref;
+    int adpcm_step;
     int block_size;
     int fifo;
     int freq;
@@ -181,6 +250,21 @@ struct SB16State {
      * the deadline is polled from pc_step() instead - see sb16_poll(). */
     uint32_t aux_deadline_us;
     int      aux_pending;
+
+    /* The block-completion interrupt, held back until the block would
+     * actually have finished playing; see where left_till_irq reaches zero. */
+    /*
+     * The block-completion interrupt waits for the play pointer, not the copy
+     * pointer: a real card raises it when the DAC has clocked the block out.
+     * irq_fallback_us is a guard for a guest that stops consuming - without it
+     * a paused stream would owe an interrupt for ever.
+     */
+    unsigned int irq_at_q;
+    int          irq_await_play;
+    uint32_t     irq_fallback_us;
+    uint32_t cmd_us;          /* when the last DSP command byte was written */
+    int      irq_watch;       /* count acknowledges from here on */
+    uint32_t picnow_us;       /* next refresh of the live PIC snapshot */
     volatile uint8_t irq_raise_pending;   /* core 1 asked for a rising edge */
 
     /* mixer state */
@@ -250,11 +334,109 @@ static inline void sb_set_irq(SB16State *s, int level)
  * reads for one cluster) while staying well short of the block sizes games
  * actually use, so a block still takes a block's worth of time to finish.
  */
-#define SB16_LEAD_MS 20
+/*
+ * How far the DMA may read ahead of what has actually been played.
+ *
+ * This was 20 ms, which is less than the machine's own worst pause: measured
+ * on The Last Eichhof, the longest interval between two DMA refills was
+ * 76.6 ms and a single SD card read alone takes up to 13.6 ms, so the ring
+ * ran dry 442 times in ten seconds - the "music plays but is not clean" and
+ * the stutter while a game loads are the same starvation.
+ *
+ * The look-ahead can only be raised because the block-completion interrupt no
+ * longer fires when the bytes are *copied*; see irq_at_q below.  While it did,
+ * a large look-ahead swallowed a whole block in one call and Tyrian 2000
+ * queued the next one twenty-five times too fast.
+ */
+#define SB16_LEAD_MS 100
+
+/*
+ * Creative ADPCM, the compression the DSP's 0x16/0x74/0x76 command families
+ * carry.  It was never implemented here: those commands were empty stubs, so
+ * a game that used them programmed a transfer, got one block, and never heard
+ * anything again.  The Last Eichhof is the case that found it - its in-game
+ * sound is auto-init 2.6-bit ADPCM (command 0x7f), which is why the music
+ * stopped the moment the intro ended.
+ *
+ * Tables and bit order follow the Sound Blaster decoder in DOSBox-X, which is
+ * the reference implementation everything else is checked against.
+ */
+static const int8_t adpcm_scale4[64] = {
+     0,  1,  2,  3,  4,  5,  6,  7,  0, -1, -2, -3, -4, -5, -6, -7,
+     1,  3,  5,  7,  9, 11, 13, 15, -1, -3, -5, -7, -9,-11,-13,-15,
+     2,  6, 10, 14, 18, 22, 26, 30, -2, -6,-10,-14,-18,-22,-26,-30,
+     4, 12, 20, 28, 36, 44, 52, 60, -4,-12,-20,-28,-36,-44,-52,-60
+};
+static const uint8_t adpcm_adj4[64] = {
+      0, 0, 0, 0, 0, 16, 16, 16,   0, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16, 240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16, 240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0,  0,  0,  0, 240, 0, 0, 0, 0,  0,  0,  0
+};
+static const int8_t adpcm_scale3[40] = {
+     0,  1,  2,  3,  0, -1, -2, -3,
+     1,  3,  5,  7, -1, -3, -5, -7,
+     2,  6, 10, 14, -2, -6,-10,-14,
+     4, 12, 20, 28, -4,-12,-20,-28,
+     5, 15, 25, 35, -5,-15,-25,-35
+};
+static const uint8_t adpcm_adj3[40] = {
+      0, 0, 0, 8,   0, 0, 0, 8,
+    248, 0, 0, 8, 248, 0, 0, 8,
+    248, 0, 0, 8, 248, 0, 0, 8,
+    248, 0, 0, 8, 248, 0, 0, 8,
+    248, 0, 0, 0, 248, 0, 0, 0
+};
+static const int8_t adpcm_scale2[24] = {
+     0,  1,  0, -1,  1,  3, -1,  -3,
+     2,  6, -2, -6,  4, 12, -4, -12,
+     8, 24, -8,-24, 16, 48,-16, -48
+};
+static const uint8_t adpcm_adj2[24] = {
+      0, 4,   0, 4,
+    248, 4, 248, 4,
+    248, 4, 248, 4,
+    248, 4, 248, 4,
+    248, 4, 248, 4,
+    248, 0, 248, 0
+};
+
+static uint8_t sb16_adpcm_decode (SB16State *s, unsigned code)
+{
+    const int8_t *scale;
+    const uint8_t *adj;
+    int limit, samp, ref;
+
+    switch (s->adpcm_bits) {
+    case 4:  scale = adpcm_scale4; adj = adpcm_adj4; limit = 63; break;
+    case 3:  scale = adpcm_scale3; adj = adpcm_adj3; limit = 39; break;
+    default: scale = adpcm_scale2; adj = adpcm_adj2; limit = 23; break;
+    }
+
+    samp = (int)code + s->adpcm_step;
+    if (samp < 0) samp = 0;
+    else if (samp > limit) samp = limit;
+
+    ref = (int)s->adpcm_ref + scale[samp];
+    s->adpcm_ref = (uint8_t)(ref < 0 ? 0 : (ref > 255 ? 255 : ref));
+    s->adpcm_step = (s->adpcm_step + adj[samp]) & 0xff;
+    return s->adpcm_ref;
+}
+
+/* Decoded samples per compressed byte. */
+static inline int sb16_adpcm_spb (const SB16State *s)
+{
+    return s->adpcm_bits == 4 ? 2 : (s->adpcm_bits == 3 ? 3 : 4);
+}
 
 static int sb16_lead_bytes (SB16State *s)
 {
-    int lead = (s->bytes_per_second / 1000) * SB16_LEAD_MS;
+    /* Single-cycle drivers may edit the live DMA buffer using its current
+     * count (Teenagent's half-buffer mixer does this). A 100 ms snapshot
+     * hides those edits from the DAC. Keep this experiment limited to
+     * single-cycle playback; auto-init retains its existing cushion. */
+    int lead_ms = s->dma_auto ? SB16_LEAD_MS : 8;
+    int lead = (s->bytes_per_second / 1000) * lead_ms;
     if (lead < 64) lead = 64;
     if (lead > AUDIO_BUF_LEN / 2) lead = AUDIO_BUF_LEN / 2;
     return lead & ~s->align;
@@ -377,6 +559,14 @@ static void continue_dma8 (SB16State *s)
 
 static void dma_cmd8 (SB16State *s, int mask, int dma_len)
 {
+    /* Whatever the previous transfer was, this one is compressed only if the
+     * command that called us just armed it. */
+    s->adpcm_bits = s->adpcm_next_bits;
+    s->adpcm_haveref = s->adpcm_next_ref;
+    s->adpcm_step = 0;
+    s->adpcm_next_bits = 0;
+    s->adpcm_next_ref = 0;
+
     s->fmt = AUDIO_FORMAT_U8;
     s->use_hdma = 0;
     s->fmt_bits = 8;
@@ -451,6 +641,8 @@ static void dma_cmd8 (SB16State *s, int mask, int dma_len)
 
 static void dma_cmd (SB16State *s, uint8_t cmd, uint8_t d0, int dma_len)
 {
+    s->adpcm_bits = 0;
+    s->adpcm_haveref = 0;
     frank_diag_ev(FRANK_EV_DSP_CMD, cmd, (uint16_t)dma_len, (uint32_t)d0);
     s->use_hdma = cmd < 0xc0;
     s->fifo = (cmd >> 1) & 1;
@@ -627,7 +819,7 @@ static void sb16_direct_dac (SB16State *s, uint8_t sample)
         else if (level < AUDIO_BUF_LEN / 4u)   f -= f / 64u;
 
         if (f < 4000u)  f = 4000u;
-        if (f > 44100u) f = 44100u;
+        if (f > (uint32_t)SOUND_FREQUENCY) f = SOUND_FREQUENCY;
         s->dac_freq = f;
         s->dac_win_us = now;
         s->dac_win_n = 0;
@@ -778,40 +970,37 @@ static void command (SB16State *s, uint8_t cmd)
             s->needed_bytes = 2;
             break;
 
-        case 0x74:
-            s->needed_bytes = 2; /* DMA DAC, 4-bit ADPCM */
-            qemu_log_mask(LOG_UNIMP, "0x75 - DMA DAC, 4-bit ADPCM not"
-                          " implemented\n");
-            break;
-
-        case 0x75:              /* DMA DAC, 4-bit ADPCM Reference */
-            s->needed_bytes = 2;
-            qemu_log_mask(LOG_UNIMP, "0x74 - DMA DAC, 4-bit ADPCM Reference not"
-                          " implemented\n");
-            break;
-
+        /*
+         * ADPCM.  0x16/0x74/0x76 and their Reference variants take a two-byte
+         * length and run once; 0x1f/0x7d/0x7f are auto-init and take none,
+         * reusing the block size command 0x48 set.  The mode is armed here and
+         * consumed by dma_cmd8().
+         */
+        case 0x16:              /* DMA DAC, 2-bit ADPCM */
+        case 0x17:              /* ...with reference */
+        case 0x74:              /* DMA DAC, 4-bit ADPCM */
+        case 0x75:              /* ...with reference */
         case 0x76:              /* DMA DAC, 2.6-bit ADPCM */
+        case 0x77:              /* ...with reference */
             s->needed_bytes = 2;
-            qemu_log_mask(LOG_UNIMP, "0x74 - DMA DAC, 2.6-bit ADPCM not"
-                          " implemented\n");
             break;
 
-        case 0x77:              /* DMA DAC, 2.6-bit ADPCM Reference */
-            s->needed_bytes = 2;
-            qemu_log_mask(LOG_UNIMP, "0x74 - DMA DAC, 2.6-bit ADPCM Reference"
-                          " not implemented\n");
+        case 0x1f:              /* auto-init 2-bit ADPCM, reference */
+            s->adpcm_next_bits = 2;
+            s->adpcm_next_ref = 1;
+            dma_cmd8 (s, DMA8_AUTO, -1);
             break;
 
-        case 0x7d:
-            qemu_log_mask(LOG_UNIMP, "0x7d - Autio-Initialize DMA DAC, 4-bit"
-                          " ADPCM Reference\n");
-            qemu_log_mask(LOG_UNIMP, "not implemented\n");
+        case 0x7d:              /* auto-init 4-bit ADPCM, reference */
+            s->adpcm_next_bits = 4;
+            s->adpcm_next_ref = 1;
+            dma_cmd8 (s, DMA8_AUTO, -1);
             break;
 
-        case 0x7f:
-            qemu_log_mask(LOG_UNIMP, "0x7d - Autio-Initialize DMA DAC, 2.6-bit"
-                          " ADPCM Reference\n");
-            qemu_log_mask(LOG_UNIMP, "not implemented\n");
+        case 0x7f:              /* auto-init 2.6-bit ADPCM, reference */
+            s->adpcm_next_bits = 3;
+            s->adpcm_next_ref = 1;
+            dma_cmd8 (s, DMA8_AUTO, -1);
             break;
 
         case 0x80:
@@ -1074,11 +1263,14 @@ static void complete (SB16State *s)
             ldebug ("set dma block len %d\n", s->block_size);
             break;
 
-        case 0x74:
-        case 0x75:
-        case 0x76:
-        case 0x77:
-            /* ADPCM stuff, ignore */
+        case 0x16: case 0x17:
+        case 0x74: case 0x75:
+        case 0x76: case 0x77:
+            /* The odd command of each pair carries a reference byte. */
+            s->adpcm_next_bits = (s->cmd == 0x16 || s->cmd == 0x17) ? 2
+                               : (s->cmd == 0x74 || s->cmd == 0x75) ? 4 : 3;
+            s->adpcm_next_ref = s->cmd & 1;
+            dma_cmd8 (s, 0, dsp_get_lohi (s) + 1);
             break;
 
         case 0x80:
@@ -1185,6 +1377,7 @@ static void legacy_reset (SB16State *s)
 
 static void reset (SB16State *s)
 {
+    s->irq_await_play = 0;
     sb_set_irq(s, 0);
     if (s->dma_auto) {
         sb_set_irq(s, 1);
@@ -1235,7 +1428,10 @@ void sb16_dsp_write(void *opaque, uint32_t nport, uint32_t val)
     frank_diag_ev(FRANK_EV_DSP_W, (uint8_t)iport, 0, val);
     SB_DIAG[SB_DIAG_WRITES]++;
     if (iport == 0x6) SB_DIAG[SB_DIAG_RESETS]++;
-    else if (iport == 0xc) SB_DIAG[SB_DIAG_LASTCMD] = val;
+    else if (iport == 0xc) {
+        SB_DIAG[SB_DIAG_LASTCMD] = val;
+        s->cmd_us = time_us_32();
+    }
     if ((unsigned)iport < 16u) SB_DIAG[SB_DIAG_WPORT + iport]++;
     sb_ring_note((unsigned)iport, val, 0);
 
@@ -1319,9 +1515,10 @@ void sb16_dsp_write(void *opaque, uint32_t nport, uint32_t val)
 uint32_t sb16_dsp_read(void *opaque, uint32_t nport)
 {
     SB_DIAG[SB_DIAG_READS]++;
-    { int rp = (int)(nport - ((SB16State *)opaque)->port);
+    { SB16State *sd = opaque;
+      int rp = (int)(nport - sd->port);
       if ((unsigned)rp < 16u) SB_DIAG[SB_DIAG_RPORT + rp]++;
-      sb_ring_note((unsigned)rp, 0, 1); }
+      if (rp == 0x0e && sd->irq_watch) SB_DIAG[SB_DIAG_ACKS]++; }
     SB16State *s = opaque;
     int iport, retval, ack = 0;
 
@@ -1392,6 +1589,10 @@ uint32_t sb16_dsp_read(void *opaque, uint32_t nport)
     }
 
     frank_diag_ev(FRANK_EV_DSP_R, (uint8_t)iport, 0, (uint32_t)retval);
+    /* The value matters as much as the port: a detection gives up on what it
+     * read back, and a ring that records only "a read happened" cannot say
+     * which answer it disliked. */
+    sb_ring_note((unsigned)iport, (unsigned)retval, 1);
     return retval;
 
  error:
@@ -1427,6 +1628,33 @@ void sb16_poll (SB16State *s)
         s->irq_raise_pending = 0;
         __dmb();
         s->set_irq(s->pic, s->irq, 1);
+    }
+
+    /* The block-completion interrupt, once the samples have been played. */
+    if (s->irq_await_play &&
+        ((int)(s->audio_p - s->irq_at_q) >= 0 ||
+         (int32_t)(time_us_32() - s->irq_fallback_us) >= 0)) {
+        s->irq_await_play = 0;
+        SB_DIAG[SB_DIAG_IVT5] = *(volatile uint32_t *)(0x11000000u + 0x34u);
+        for (unsigned v = 0; v < 8; v++)
+            SB_DIAG[SB_DIAG_IVT + v] =
+                *(volatile uint32_t *)(0x11000000u + 0x20u + 4u * v);
+        SB_DIAG[SB_DIAG_CMDUS] = time_us_32() - s->cmd_us;
+        SB_DIAG[SB_DIAG_PICPRE] = i8259_debug_master(s->pic);
+        s->irq_watch = 1;
+        SB_DIAG[SB_DIAG_ACKS] = 0;
+        SB_DIAG[SB_DIAG_BLKIRQ]++;
+        sb_set_irq(s, 1);
+        SB_DIAG[SB_DIAG_PICPOST] = i8259_debug_master(s->pic);
+    }
+
+    /* Refresh the live PIC word only while a probe is outstanding, and only
+     * a few times a second: this runs from pc_step(), so an unconditional
+     * PSRAM write here costs one on every emulated step and stalls the
+     * machine to a standstill. */
+    if (s->irq_watch && (int32_t)(time_us_32() - s->picnow_us) >= 0) {
+        s->picnow_us = time_us_32() + 50000u;
+        SB_DIAG[SB_DIAG_PICNOW] = i8259_debug_master(s->pic);
     }
 
     if (!s->aux_pending) {
@@ -1641,6 +1869,56 @@ static int write_audio (SB16State *s, int nchan, int dma_pos,
         unsigned int len = AUDIO_BUF_LEN - (s->audio_q - s->audio_p);
         if (len > AUDIO_BUF_LEN)
             len = 0;
+        if (s->adpcm_bits) {
+            /*
+             * One compressed byte becomes two, three or four samples, so the
+             * ring's free space is the budget and `len` counts the DMA bytes
+             * actually consumed - which is what the block and terminal-count
+             * accounting above is denominated in.
+             */
+            const int spb = sb16_adpcm_spb (s);
+            unsigned int n = len / (unsigned)spb;
+            if ((unsigned int)copied < n) n = (unsigned int)copied;
+            for (unsigned int i = 0; i < n; i++) {
+                const uint8_t b = tmpbuf[i];
+                if (s->adpcm_haveref) {
+                    /* The first byte of the block is the initial sample. */
+                    s->adpcm_haveref = 0;
+                    s->adpcm_ref = b;
+                    s->adpcm_step = 0;
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] = b;
+                    continue;
+                }
+                switch (s->adpcm_bits) {
+                case 4:
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] =
+                        sb16_adpcm_decode (s, (b >> 4) & 0xfu);
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] =
+                        sb16_adpcm_decode (s, b & 0xfu);
+                    break;
+                case 3:
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] =
+                        sb16_adpcm_decode (s, (b >> 5) & 0x7u);
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] =
+                        sb16_adpcm_decode (s, (b >> 2) & 0x7u);
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] =
+                        sb16_adpcm_decode (s, (b & 0x3u) << 1);
+                    break;
+                default:
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] =
+                        sb16_adpcm_decode (s, (b >> 6) & 0x3u);
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] =
+                        sb16_adpcm_decode (s, (b >> 4) & 0x3u);
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] =
+                        sb16_adpcm_decode (s, (b >> 2) & 0x3u);
+                    s->audio_buf[s->audio_q++ % AUDIO_BUF_LEN] =
+                        sb16_adpcm_decode (s, b & 0x3u);
+                    break;
+                }
+            }
+            len = n;
+            goto counted;
+        }
         if (copied < len)
             len = copied;
         if (len) {
@@ -1654,6 +1932,7 @@ static int write_audio (SB16State *s, int nchan, int dma_pos,
             }
             s->audio_q += len;
         }
+counted:
         copied = len;
 
         temp -= copied;
@@ -1684,6 +1963,23 @@ static int write_audio (SB16State *s, int nchan, int dma_pos,
 
     return net;
 }
+
+#if I8257_COUNT_IS_PLAY_POS
+/*
+ * Bytes taken from guest memory but not yet played.
+ *
+ * This is what the DMA count register has to subtract so that a guest
+ * reading it sees the play cursor rather than the transfer cursor.  The
+ * queue is bounded by sb16_lead_bytes(), so the correction is small and
+ * never negative.
+ */
+static int SB_queued_bytes (void *opaque, int nchan)
+{
+    SB16State *s = opaque;
+    (void) nchan;
+    return (int)(s->audio_q - s->audio_p);
+}
+#endif
 
 static int SB_read_DMA (void *opaque, int nchan, int dma_pos, int dma_len)
 {
@@ -1800,7 +2096,65 @@ static int SB_read_DMA (void *opaque, int nchan, int dma_pos, int dma_len)
 
     if (s->left_till_irq <= 0) {
         s->mixer_regs[0x82] |= (nchan & 4) ? 2 : 1;
-        sb_set_irq(s, 1);
+        /*
+         * Hold the interrupt back until the block would have finished playing
+         * on a real card.
+         *
+         * Raising it here is raising it instantly: the transfer is a memcpy,
+         * not a DAC running at the sample rate.  Sierra's SNDBLAST.DRV probes
+         * the card with a one-byte DMA block and waits for the interrupt, and
+         * an interrupt that arrives before the driver has hooked the vector is
+         * not merely early - the 8259 is edge triggered and the card holds its
+         * line high until the acknowledge at base+0x0e, so with nobody there
+         * to acknowledge it the line never falls and no further edge can ever
+         * be produced.  IRQ 5 is dead for the rest of the session.
+         *
+         * Measured on Jones: the transfer ran, one interrupt was raised, and
+         * the PIC afterwards read last_irr 0x30, irr 0x10, imr 0xd0 - the line
+         * high, unmasked and not pending.  The game reported "Unable to
+         * initialize your music hardware".
+         *
+         * The floor matters more than the exact figure: the block has to take
+         * long enough for the driver to finish arming.  The ceiling keeps
+         * streaming playback from gaining latency at every block boundary,
+         * where the pacing already comes from the lead limit above.
+         */
+        {
+            uint32_t us = 1000u;
+            if (s->bytes_per_second > 0 && s->block_size > 0) {
+                uint64_t t = ((uint64_t)(uint32_t)s->block_size * 1000000u)
+                           / (uint32_t)s->bytes_per_second;
+                us = (uint32_t)(t < 1000u ? 1000u : (t > 5000u ? 5000u : t));
+            }
+            /*
+             * Raise it now.
+             *
+             * This used to hold the interrupt back by at least a
+             * millisecond, on the theory that Jones's driver was being
+             * interrupted before it had hooked its vector.  Measurement
+             * killed that theory - Jones hooks no vector at all and tests
+             * the DMA controller's terminal count instead - and the delay
+             * is worse than useless for every driver that *does* probe by
+             * interrupt: sb16_poll() runs from pc_step(), so the deadline
+             * is only examined once per emulation step, about 2.3 ms, and
+             * a probe that waits a few hundred microseconds per candidate
+             * IRQ has long given up by then.  A card whose IRQ 5 is never
+             * seen is exactly how a game ends up believing it is on IRQ 7.
+             */
+            (void)us;
+            /*
+             * Owe the interrupt to the play pointer.  audio_q is where the
+             * copy has reached, so waiting for audio_p to pass it is waiting
+             * for the samples of this block to have been clocked out, which
+             * is when a real card raises it.  The fallback covers a guest
+             * that pauses or silences the stream: without it the interrupt
+             * would be owed for ever.
+             */
+            s->irq_at_q = s->audio_q;
+            s->irq_await_play = 1;
+            s->irq_fallback_us = time_us_32() + 250000u;
+            SB_DIAG[SB_DIAG_IRQUS] = s->audio_q - s->audio_p;
+        }
         /* Signal DSP busy on port 0x22C so polling loops detect the
          * block completion.  Cleared on next read of port 0x22C. */
         if (s->dma_auto == 0) {
@@ -2014,11 +2368,11 @@ void sb16_audio_callback (void *opaque, uint8_t *stream, int free)
         break;
     case AUDIO_FORMAT_U16:
         if (s->fmt_stereo) {
-            i = resample_u16s((int16_t *) stream, free / 2, 44100,
+            i = resample_u16s((int16_t *) stream, free / 2, SOUND_FREQUENCY,
                               (int16_t *) s->audio_buf, p / 2, len / 2,
                               AUDIO_BUF_LEN / 2, s->freq);
         } else {
-            i = resample_u16m((int16_t *) stream, free / 2, 44100,
+            i = resample_u16m((int16_t *) stream, free / 2, SOUND_FREQUENCY,
                               (int16_t *) s->audio_buf, p / 2, len / 2,
                               AUDIO_BUF_LEN / 2, s->freq);
         }
@@ -2027,10 +2381,10 @@ void sb16_audio_callback (void *opaque, uint8_t *stream, int free)
         break;
     case AUDIO_FORMAT_U8:
         if (s->fmt_stereo) {
-            i = resample_u8s((int16_t *) stream, free / 2, 44100,
+            i = resample_u8s((int16_t *) stream, free / 2, SOUND_FREQUENCY,
                              s->audio_buf, p, len, AUDIO_BUF_LEN, s->freq);
         } else {
-            i = resample_u8m((int16_t *) stream, free / 2, 44100,
+            i = resample_u8m((int16_t *) stream, free / 2, SOUND_FREQUENCY,
                              s->audio_buf, p, len, AUDIO_BUF_LEN, s->freq);
         }
         s->audio_p += i;
@@ -2095,9 +2449,9 @@ SB16State *sb16_new(
     memset(s, 0, sizeof(SB16State));
     s->voice = s;
 
-    s->ver = 0x0405;
+    s->ver = SB_DIAG[SB_DIAG_VER] ? (uint16_t)SB_DIAG[SB_DIAG_VER] : 0x0405;
     s->port = port;
-    s->irq = irq;
+    s->irq = SB_DIAG[SB_DIAG_IRQ_SEL] ? (int)SB_DIAG[SB_DIAG_IRQ_SEL] : irq;
     s->dma = 1;
     s->hdma = 5;
     s->cmd = -1;
@@ -2124,13 +2478,17 @@ SB16State *sb16_new(
     i8257_dma_register_channel(s->isa_hdma, s->hdma, SB_read_DMA, s);
 
     i8257_dma_register_channel(s->isa_dma, s->dma, SB_read_DMA, s);
+#if I8257_COUNT_IS_PLAY_POS
+    i8257_dma_set_queued_handler(s->isa_hdma, s->hdma, SB_queued_bytes);
+    i8257_dma_set_queued_handler(s->isa_dma, s->dma, SB_queued_bytes);
+#endif
 
     s->can_write = 1;
 
     return s;
 }
 
-// call sb16_getsample 44100 times per second
+// call sb16_getsample SOUND_FREQUENCY times per second
 /*
  * Playback starvation, sampled in the 44.1 kHz mixer callback on core 1.
  *
@@ -2178,7 +2536,7 @@ void __not_in_flash_func(sb16_getsample)(SB16State *s, int* r_v, int* l_v) {
         return;
 
     static uint32_t phase = 0;
-    uint32_t step = ((uint32_t)s->freq << 16) / 44100;
+    uint32_t step = ((uint32_t)s->freq << 16) / SOUND_FREQUENCY;
 
     int frame_size = s->fmt_stereo ?
         (s->fmt == AUDIO_FORMAT_U8 || s->fmt == AUDIO_FORMAT_S8 ? 2 : 4) :
@@ -2189,9 +2547,42 @@ void __not_in_flash_func(sb16_getsample)(SB16State *s, int* r_v, int* l_v) {
     phase &= 0xffff;
 
     if (advance > (int)len) advance = len;
+
+#if SB16_DECODE_BEFORE_ADVANCE
+    /*
+     * Decode where the read pointer is, then move it - not the other way
+     * round.
+     *
+     * audio_q is exclusive: the byte at audio_q is the next one the DMA
+     * will write, and until it does it still holds whatever was there a
+     * lap ago.  Advancing first means the frame decoded is always the one
+     * after the frame that was actually paid for, and when the advance
+     * lands exactly on audio_q - which it does every time the consumer
+     * catches the producer - what comes out is that stale byte from the
+     * previous lap through the 4096-byte ring.
+     *
+     * The buffer runs near-empty, because the lead is 8 ms for a
+     * single-cycle DSP command, so this is not rare.  On Teenagent it is
+     * once per DMA block: 104 starvation runs and 8229 empty ticks in a
+     * 12 s window is 8.7 runs/s against a block rate of 11236/1312 =
+     * 8.6/s, each run about 1.7 ms long.
+     *
+     * With nothing left to consume, hold the frame the pointer has just
+     * passed rather than the unwritten one it is sitting on.  That needs
+     * no extra state - the previous frame is still in the ring - which is
+     * what separates this from the rejected pcm-boundary patch, which
+     * also grew the struct, reordered the publish and added a barrier.
+     */
+    unsigned int p = s->audio_p;
+    if (len == 0 && p >= (unsigned)frame_size)
+        p -= (unsigned)frame_size;
+    p %= AUDIO_BUF_LEN;
+    s->audio_p += advance;
+#else
     s->audio_p += advance;
 
     unsigned int p = s->audio_p % AUDIO_BUF_LEN;
+#endif
     int16_t l = 0, r = 0;
 
     switch (s->fmt) {

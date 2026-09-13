@@ -305,6 +305,15 @@ static __always_inline u8 _pc_io_read(void *o, int addr)
 	case 0x18: case 0x19: case 0x1a: case 0x1b:
 	case 0x1c: case 0x1d: case 0x1e: case 0x1f:
 		val = i8257_read_cont(pc->isa_dma, addr & 0x07, 1);
+		/* Who is reading the status register, and from where.  Reading
+		 * it clears the terminal-count bits, so two reads of the same
+		 * instruction would hand the second one a zero - which is what
+		 * Sierra's card detection ends up seeing. */
+		if ((addr & 0x07) == 0) {
+			uint32_t dcs, dip; int dhalt;
+			cpui386_get_state(pc->cpu, &dcs, &dip, &dhalt);
+			i8257_diag_note_reader(dcs, dip, (uint32_t)val);
+		}
 		return val;
 	case 0x81: case 0x82: case 0x83: case 0x87:
 		val = i8257_read_page(pc->isa_dma, addr - 0x80);

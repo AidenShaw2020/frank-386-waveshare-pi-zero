@@ -145,6 +145,23 @@ static inline void pic_intack(PicState *s, int irq)
 	s->irr &= ~(1 << irq);
 }
 
+/*
+ * Master PIC state in one word, for the SWD diagnostics: last_irr is the
+ * state of the input lines, irr what is latched, imr the mask and isr what
+ * is being serviced.  Reading these from the host over SWD would mean
+ * knowing the struct layout, which changes; a packed word does not.
+ */
+/* How often an interrupt was withdrawn between the raise and the
+ * acknowledge; see the else branch in i8259_read_irq(). */
+volatile uint32_t g_pic_withdrawn __attribute__((used));
+
+uint32_t i8259_debug_master(PicState2 *s)
+{
+    const PicState *p = &s->pics[0];
+    return (uint32_t)p->last_irr | ((uint32_t)p->irr << 8) |
+           ((uint32_t)p->imr << 16) | ((uint32_t)p->isr << 24);
+}
+
 int i8259_read_irq(PicState2 *s)
 {
 	int irq, irq2, intno;
@@ -166,9 +183,31 @@ int i8259_read_irq(PicState2 *s)
 			intno = s->pics[0].irq_base + irq;
 		}
 	} else {
-		/* spurious IRQ on host controller */
-		irq = 7;
-		intno = s->pics[0].irq_base + irq;
+		/*
+		 * Nothing is pending any more, so there is nothing to deliver.
+		 *
+		 * This used to synthesise the 8259's spurious IRQ 7.  On real
+		 * hardware that only happens when the request disappears inside
+		 * the INTA cycle itself, a window of nanoseconds; INTR is a
+		 * level, so a request withdrawn or masked before then simply
+		 * deasserts it and the CPU never takes an interrupt at all.
+		 *
+		 * Here cpu->intr is a sticky latch and the acknowledge can
+		 * follow the raise by thousands of guest instructions, so that
+		 * window is the whole gap between them - and a driver probing
+		 * for its Sound Blaster masks and unmasks the candidate IRQs
+		 * right across it.  The driver then sees INT 0Fh, concludes the
+		 * card is on IRQ 7 and hooks that vector; the real IRQ 5 is
+		 * never acknowledged at base+0x0e, the card holds its line high,
+		 * and the edge-triggered 8259 can never produce another edge.
+		 * That is the "plays for a moment, then freezes" report.
+		 *
+		 * Returning -1 makes INTR behave like the level it is: the
+		 * caller delivers nothing.
+		 */
+		g_pic_withdrawn++;
+		pic_update_irq(s);
+		return -1;
 	}
 	pic_update_irq(s);
 	return intno;

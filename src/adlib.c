@@ -44,15 +44,26 @@
  * cannot show that; the order can.  Lives in the PSRAM diagnostic block, so
  * it costs no SRAM.
  */
-#define OPL_DIAG ((volatile uint32_t *)(0x11000000u + 0x000a8000u))
-#define OPL_DIAG_HEAD  964
-#define OPL_DIAG_RING  968      /* 968..999: reg<<16 | val<<8 | isread */
-#define OPL_DIAG_N     32
+/*
+ * On the Sound Blaster's own diagnostic page, and it records the *first*
+ * events after the host zeroes the head rather than the last.
+ *
+ * A driver that fails its FM detection then sits in a poll loop forever, so
+ * a wrap-around ring read afterwards holds nothing but thousands of
+ * identical status reads - which is exactly what it looked like on Jones.
+ * What decides the failure is the opening handshake, so the ring is armed
+ * from the host just before the game is launched and stops when it is full.
+ */
+#define OPL_DIAG ((volatile uint32_t *)(0x11000000u + 0x000aa000u))
+#define OPL_DIAG_HEAD  352
+#define OPL_DIAG_RING  360      /* 360..871: reg<<16 | val<<8 | isread */
+#define OPL_DIAG_N     512
 static inline void opl_diag_note(unsigned reg, unsigned val, unsigned isread)
 {
-    const uint32_t h = OPL_DIAG[OPL_DIAG_HEAD] % OPL_DIAG_N;
+    const uint32_t h = OPL_DIAG[OPL_DIAG_HEAD];
+    if (h >= OPL_DIAG_N) return;
     OPL_DIAG[OPL_DIAG_RING + h] = (reg << 16) | ((val & 0xffu) << 8) | isread;
-    OPL_DIAG[OPL_DIAG_HEAD]++;
+    OPL_DIAG[OPL_DIAG_HEAD] = h + 1u;
 }
 
 #endif
@@ -107,6 +118,11 @@ struct AdlibState {
 
     uint32_t underrun_count;
 };
+
+_Static_assert((ADLIB_RING_SAMPLES & (ADLIB_RING_SAMPLES - 1u)) == 0,
+               "ADLIB ring size must be a power of two");
+_Static_assert(ADLIB_LEAD_SAMPLES < ADLIB_RING_SAMPLES,
+               "ADLIB lead must leave at least one free ring sample");
 
 /*
  * Does the guest actually drive OPL3's second register bank?
@@ -278,7 +294,7 @@ void adlib_write(void *opaque, uint32_t nport, uint32_t val)
             {
                 const uint8_t reg = (uint8_t)s->adlib_register;
                 frank_diag_opl_write(nport, reg, (uint8_t)val, 1);
-                if (reg <= 4) opl_diag_note(reg, (unsigned)val, 0);
+                opl_diag_note(reg, (unsigned)val, 0);
                 if (reg <= 4) {
                     if (reg == 0)
                         s->adlibregmem[0] = (uint16_t)((s->adlibregmem[0] &
@@ -305,7 +321,6 @@ uint32_t adlib_read(void *opaque, uint32_t nport)
         case 0x228: case 0x229:
         case 0x220: case 0x221:
             FRANK_DIAG_COUNT(opl_status);
-            opl_diag_note(0xff, 0, 1);
             /*
              * Status from the timer control register, honouring the masks.
              *
@@ -409,7 +424,7 @@ int16_t __not_in_flash_func(adlib_getsample)(AdlibState *s) {
  * core 0 is doing. If it comes back far smaller, the fault is on the consumer
  * side instead and this whole line of attack is wrong.
  */
-#define ADLIB_DEPTH_US (ADLIB_NBUF * ADLIB_BATCH_SIZE * 1000000u / 44100u)
+#define ADLIB_DEPTH_US (ADLIB_NBUF * ADLIB_BATCH_SIZE * 1000000u / (unsigned)SOUND_FREQUENCY)
 
 uint32_t g_adlib_calls;
 uint32_t g_adlib_gap_max_us;

@@ -5387,7 +5387,7 @@ int bj_try_execute(CPUI386 *cpu, int max_steps)
 #define NJ_CACHE_SET_BITS   4u
 #endif
 #define NJ_CACHE_SETS       (1u << NJ_CACHE_SET_BITS)
-_Static_assert(NJ_CACHE_SET_BITS <= 32u,
+_Static_assert(NJ_CACHE_SET_BITS <= 6u,
                "nj_cache_replace_bits holds one bit per set");
 #define NJ_CACHE_WAYS       2u
 #define NJ_CACHE_SLOTS      (NJ_CACHE_SETS * NJ_CACHE_WAYS)
@@ -5611,8 +5611,9 @@ static u8 nj_page_bits[NJ_PAGE_BYTES];
  * conflict insertion, never on the hot execution path.  It has to be as wide
  * as NJ_CACHE_SETS: as a u16 the shifts for sets 16 and above were undefined
  * and in practice pinned those sets to way 0, so NJIT_BIG_CACHE's 32 sets
- * would have replaced half the table with no alternation at all. */
-static u32 nj_cache_replace_bits;
+ * would have replaced half the table with no alternation at all.  u64 carries
+ * the 64 sets a six-bit index needs. */
+static uint64_t nj_cache_replace_bits;
 
 /* FRANK_NATIVE_JIT_V44_SAMPLED_DISCOVERY
  *
@@ -6017,6 +6018,17 @@ static inline void nj_xr_note(const nj_block_t *b, uword nip, int done)
 #define NJ_V6_PM16_LIM     528   /* +SEG_ES/CS/SS/DS, i.e. 528..531 */
 #define NJ_V6_STOP_MOD     532   /* +mod field of the stopping ModR/M, 532..535 */
 /*
+ * What the refused prefix actually was, and what it prefixed.
+ *
+ * nj_v6_prefix() turns down f0/f2/f3 wholesale, and on Tyrian 2000 that is
+ * the single largest refusal - 699 trace stops and 314 poisoned heads in
+ * fifteen seconds.  Which string instruction it is decides what would have
+ * to be emitted to take them, so counting them apart is worth eight slots.
+ */
+#define NJ_V6_PFX_STR      536   /* 536..543: movsb movsw cmpsb cmpsw
+                                  *           stosb stosw lods  other */
+#define NJ_V6_PFX_REP      544   /* 544..546: f3, f2, f0 */
+/*
  * The opcode a trace refused at its very first instruction, 600..855.
  *
  * A trace that decodes nothing is counted in NJ_V6_BAIL_EMPTY and its opcode
@@ -6086,6 +6098,83 @@ static inline void nj_xr_note(const nj_block_t *b, uword nip, int done)
 #define NJ_V6_RET_ROOM     918   /* imm16 does not fit the code window */
 #define NJ_V6_RET_SEG      919   /* nj_v6_note_seg refused SS */
 #define NJ_V6_RET_OK       920
+
+/*
+ * The FIRST fault, kept separately from the last one.
+ *
+ * Flight Simulator 5 ends up executing data and takes 1.6 million #UD; by
+ * the time anyone reads the diagnostic block, the fault that actually
+ * started it has been overwritten 1.6 million times.  Only the first one
+ * says where the guest left the rails, so it is latched once and never
+ * touched again.  NJ_V6_EXC_FIRST_SEEN doubles as the latch, which is why
+ * it is written last.
+ */
+#define NJ_V6_EXC_FIRST_NO   921
+#define NJ_V6_EXC_FIRST_ERR  922
+#define NJ_V6_EXC_FIRST_CS   923
+#define NJ_V6_EXC_FIRST_IP   924
+#define NJ_V6_EXC_FIRST_SEEN 925
+/* ...and the first fault that was not the same kind as the first of all,
+ * because a storm of one exception can still be the consequence of a
+ * different one that came earlier or just after. */
+#define NJ_V6_EXC_SECOND_NO  926
+#define NJ_V6_EXC_SECOND_ERR 927
+#define NJ_V6_EXC_SECOND_CS  928
+#define NJ_V6_EXC_SECOND_IP  929
+#define NJ_V6_EXC_SECOND_SEEN 930
+
+/*
+ * The first occurrence of *each* vector: err, CS base, IP, seen.
+ *
+ * "First fault" and "first of another kind" gave #GP then #DE for Flight
+ * Simulator, which is useful but still does not say where execution left
+ * the rails - that is the address of the first #UD, buried under the
+ * 1.6 million that follow it.  One latch per vector costs 128 words of a
+ * PSRAM hole that has 2048, and answers it directly.
+ */
+/*
+ * NOTHING IN THIS BLOCK MAY USE A SLOT >= 1024.
+ *
+ * Slots from 1024 belong to the JIT exit ring, which is why the sound
+ * diagnostics had to move out of this hole once already.  Two diagnostics
+ * added here were read as real findings before that was noticed: the
+ * per-vector latches for vectors 21 upwards land at 940 + 4*21 = 1024
+ * exactly, and came back full of ring data that looked like faults.
+ *
+ * Sixteen vectors is enough - everything an emulated 486 can raise is 0..14.
+ */
+#define NJ_V6_EXC_EACH     940   /* 940..1003: 16 x {err, cs, ip, seen} */
+#define NJ_V6_EXC_EACH_N   16
+
+/*
+ * Why call_isr() refused an interrupt gate, the first time it did.
+ *
+ * Flight Simulator 5's first fault is #GP with error code 0x92 - vector 18,
+ * INT 12h - and it is identical with EMM386, with NOEMS and with no EMM386
+ * at all, so it is not the V86 reflection path.  The same error code comes
+ * out of three different refusals in call_isr(): the IDT limit, the gate
+ * type and the DPL check.  Knowing which one decides whether the guest's
+ * IDT is genuinely short or we are reading it wrongly.
+ */
+#define NJ_V6_ISR_LIMIT   1004
+#define NJ_V6_ISR_OFF     1005
+#define NJ_V6_ISR_CPL     1006
+#define NJ_V6_ISR_WHY     1007   /* 1 limit, 2 gate type, 3 dpl, 4 not present */
+#define NJ_V6_ISR_W1      1008
+#define NJ_V6_ISR_W2      1009
+#define NJ_V6_ISR_SEEN    1010
+#define NJ_ISR_NOTE(why, w1v, w2v) do { \
+	volatile u32 *d_ = (volatile u32 *)(0x11000000u + 0x000a8000u); \
+	if (!d_[NJ_V6_ISR_SEEN]) { \
+		d_[NJ_V6_ISR_LIMIT] = (u32)cpu->idt.limit; \
+		d_[NJ_V6_ISR_OFF]   = (u32)off; \
+		d_[NJ_V6_ISR_CPL]   = (u32)cpu->cpl; \
+		d_[NJ_V6_ISR_W1]    = (u32)(w1v); \
+		d_[NJ_V6_ISR_W2]    = (u32)(w2v); \
+		d_[NJ_V6_ISR_WHY]   = (u32)(why); \
+		d_[NJ_V6_ISR_SEEN]  = 1u; \
+	} \
+} while (0)
 
 /* How many times a chain continuation must have been seen before it is
  * compiled, while the gate is engaged; 0 disables it entirely.  See
@@ -6487,8 +6576,8 @@ static nj_block_t *nj_cache_insert_slot(CPUI386 *cpu, uword linear)
         if (!nj_cache[base + w].valid)
             return &nj_cache[base + w];
 
-    unsigned way = (nj_cache_replace_bits >> set) & 1u;
-    nj_cache_replace_bits ^= (u32)1u << set;
+    unsigned way = (unsigned)((nj_cache_replace_bits >> set) & 1u);
+    nj_cache_replace_bits ^= (uint64_t)1u << set;
     nj_cache[base + way].valid = 0;
     return &nj_cache[base + way];
 }
@@ -6857,7 +6946,15 @@ typedef struct {
     bool op16;
     bool addr16;
     int seg;
+    /* F3 seen.  Only the string instructions this compiler emits look at it;
+     * every other opcode is refused while it is set, which is exactly what
+     * nj_v6_prefix() did for the whole prefix. */
+    bool rep;
 } nj_v6_pfx_t;
+
+#ifndef NJIT_REP_MOVSB
+#define NJIT_REP_MOVSB 0
+#endif
 
 typedef struct {
     int base;
@@ -7404,6 +7501,22 @@ static inline void nj_emit_store_guest(nj_emit_t *e, bool code16)
     for (unsigned r = 0; r < 8; ++r) {
         if (code16) nj_strh(e, NJ_GUEST_REG(r), NJ_CPU_REG, NJ_GPR_OFF(r));
         else        nj_str32(e, NJ_GUEST_REG(r), NJ_CPU_REG, NJ_GPR_OFF(r));
+    }
+}
+
+/*
+ * Reload what nj_emit_store_guest() spilled.
+ *
+ * The prologue does this once at block entry; a helper that reads and writes
+ * guest registers - REP MOVS is the first - needs the same pair in the middle
+ * of a block.  Only r4..r11 and r12 are touched, so a result already sitting
+ * in r2 survives.
+ */
+static inline void nj_emit_load_guest(nj_emit_t *e, bool code16)
+{
+    for (unsigned r = 0; r < 8; ++r) {
+        if (code16) nj_ldrh(e, NJ_GUEST_REG(r), NJ_CPU_REG, NJ_GPR_OFF(r));
+        else        nj_ldr32(e, NJ_GUEST_REG(r), NJ_CPU_REG, NJ_GPR_OFF(r));
     }
 }
 
@@ -9446,8 +9559,20 @@ static bool nj_v6_prefix(CPUI386 *cpu, const u8 *p, unsigned max,
         case 0x65: x->seg = SEG_GS; x->pos++; continue;
         case 0x66: x->op16 = !x->op16; x->pos++; continue;
         case 0x67: x->addr16 = !x->addr16; x->pos++; continue;
-        case 0xf0: case 0xf2: case 0xf3:
-            return false; /* interpreter fallback keeps LOCK/REP semantics */
+        case 0xf3:
+            /*
+             * REP is recorded rather than refused, because on Tyrian 2000 it
+             * was the single largest reason a trace ended: 1034 of the 1069
+             * prefix refusals in fifteen seconds, and 972 of those were REP
+             * MOVSB.  The caller still refuses every opcode it cannot emit
+             * with a REP in front, so nothing else changes.
+             */
+            if (NJIT_REP_MOVSB) {
+                x->rep = true; x->pos++; continue;
+            }
+            return false;
+        case 0xf0: case 0xf2:
+            return false; /* interpreter fallback keeps LOCK/REPNE semantics */
         default:
             return true;
         }
@@ -10885,6 +11010,137 @@ static uint64_t IRAM_ATTR nj_io_in(CPUI386 *cpu, unsigned port_and_size)
  * overwrites them.  Same shape as nj_v8_emit_refresh_flags(): three words
  * pushed so the call is made on an eight-byte boundary.
  */
+/*
+ * REP MOVSB from generated code.
+ *
+ * Tyrian 2000 is why.  Borland Pascal 7 moves memory and paints the screen
+ * with REP MOVSB, and refusing the prefix ended the trace on it: 1034 of the
+ * 1069 prefix refusals in fifteen seconds of the demo, and 615 trace heads
+ * poisoned outright, which left the loops around those moves interpreted and
+ * the game at 8.5% native coverage and 1.54 MIPS.
+ *
+ * The move itself was never the cost - the interpreter already copies a page
+ * run at a time - so this is not a faster REP, it is a REP the trace can
+ * carry on past.  It copies with the same primitives and in the same runs as
+ * MOVS_helper2(), and updates CX/SI/DI after every run, which is what makes
+ * it restartable: on a translation failure it restores the exception record
+ * and returns 0, the block side-exits at this instruction's own IP, and the
+ * interpreter re-executes what is left and raises the fault properly.
+ *
+ * Direction is read from cpu->flags rather than baked, so a block needs no
+ * DF guard.
+ */
+static int IRAM_ATTR nj_rep_movs(CPUI386 *cpu, u32 packed)
+{
+    const bool a16 = ((packed >> 8) & 1u) != 0u;
+    const int  seg = (int)((packed >> 16) & 7u);
+    const int  dir = (cpu->flags & DF) ? -1 : 1;
+    const int   save_excno  = cpu->excno;
+    const uword save_excerr = cpu->excerr;
+    OptAddr ms, md;
+
+    for (;;) {
+        uword cx = a16 ? (uword)cpu->gprx[1].r16 : cpu->gprx[1].r32;
+        if (!cx) return 1;
+        uword si = a16 ? (uword)cpu->gprx[6].r16 : cpu->gprx[6].r32;
+        uword di = a16 ? (uword)cpu->gprx[7].r16 : cpu->gprx[7].r32;
+
+        if (!translate8(cpu, &ms, 1, seg, si) ||
+            !translate8(cpu, &md, 2, SEG_ES, di)) {
+            cpu->excno = save_excno;
+            cpu->excerr = save_excerr;
+            return 0;
+        }
+
+        /* Longest run that stays inside one page at both ends, and inside
+         * the 16-bit offset when the address size is 16. */
+        uword n = cx, ns, nd;
+        if (dir > 0) {
+            ns = 4096u - (ms.addr1 & 4095u);
+            nd = 4096u - (md.addr1 & 4095u);
+            if (a16) {
+                if (0x10000u - si < ns) ns = 0x10000u - si;
+                if (0x10000u - di < nd) nd = 0x10000u - di;
+            }
+        } else {
+            ns = 1u + (ms.addr1 & 4095u);
+            nd = 1u + (md.addr1 & 4095u);
+            if (a16) {
+                if (si + 1u < ns) ns = si + 1u;
+                if (di + 1u < nd) nd = di + 1u;
+            }
+        }
+        if (ns < n) n = ns;
+        if (nd < n) n = nd;
+
+        /*
+         * Copy the run in bulk where that is sound.  Byte at a time through
+         * load8/store8 is what the plain path costs, and Tyrian's blits go
+         * straight into the VGA aperture, so without these two cases a
+         * native REP MOVSB is slower than the interpreter it replaced -
+         * MOVS_helper2() has the same iomem_write_string() shortcut.
+         */
+        bool bulk = false;
+        if (dir > 0 && cpu->cb.iomem_write_string &&
+            in_iomem(md.addr1) && in_iomem(md.addr1 + n - 1u) &&
+            !in_iomem(ms.addr1) && !in_iomem(ms.addr1 | 4095u) &&
+            (ms.addr1 | 4095u) < (uword)cpu->phys_mem_size) {
+            bulk = cpu->cb.iomem_write_string(cpu->cb.iomem, md.addr1,
+                                              cpu->phys_mem + ms.addr1,
+                                              (int)n) != 0;
+        }
+        /* Do not turn the ordinary-RAM case into memmove().  REP MOVSB is a
+         * sequence of byte stores: a forward copy to an overlapping higher
+         * address propagates the first source byte, while memmove snapshots
+         * the source.  Direct libc writes would also bypass ROM protection,
+         * write diagnostics and JIT code-page invalidation in pstore8().
+         * The VGA callback above is the only bulk path; regular RAM follows
+         * the interpreter's load8/store8 path exactly. */
+        if (!bulk) {
+            for (uword i = 0; i < n; i++) {
+                store8(cpu, &md, load8(cpu, &ms));
+                ms.addr1 += dir;
+                md.addr1 += dir;
+            }
+        }
+
+        si += (uword)((sword)n * dir);
+        di += (uword)((sword)n * dir);
+        cx -= n;
+        if (a16) {
+            cpu->gprx[6].r16 = (u16)si;
+            cpu->gprx[7].r16 = (u16)di;
+            cpu->gprx[1].r16 = (u16)cx;
+        } else {
+            cpu->gprx[6].r32 = si;
+            cpu->gprx[7].r32 = di;
+            cpu->gprx[1].r32 = cx;
+        }
+        if (!cx) return 1;
+    }
+}
+
+/*
+ * r1 carries the packed address size and segment; the completion flag comes
+ * back in r2, moved out of r0 before the pop overwrites it.  Same three-word
+ * push as nj_v8_emit_refresh_flags(), for the same alignment reason.  The
+ * caller spills and reloads the guest registers around this: the helper reads
+ * and writes CX, SI and DI in the CPU structure.
+ */
+static bool nj_v8_emit_rep_movs(nj_emit_t *e, u32 packed)
+{
+    nj_mov_reg(e, 0, NJ_CPU_REG);
+    nj_e16(e, 0xB503u);                 /* PUSH {r0, r1, lr} */
+    nj_mov_imm(e, 1, packed);
+    nj_mov_imm(e, 3, (u32)(uintptr_t)&nj_rep_movs | 1u);
+    nj_blx_reg(e, 3);
+    nj_mov_reg(e, 2, 0);                /* completed, before r0 is restored */
+    nj_pop_low(e, 0x3u);                /* POP {r0, r1} */
+    nj_pop_lr(e);
+    nj_mov_reg(e, NJ_CPU_REG, 0);
+    return !e->failed;
+}
+
 static bool nj_v8_emit_io_in(nj_emit_t *e)
 {
     nj_mov_reg(e, 0, NJ_CPU_REG);
@@ -11197,7 +11453,7 @@ static nj_block_t *nj_v6_compile_jz_entry(CPUI386 *cpu, uword start_ip,
                                           unsigned phys_page)
 {
     nj_v6_pfx_t px;
-    if (!nj_v6_prefix(cpu, code, avail, &px)) return NULL;
+    if (!nj_v6_prefix(cpu, code, avail, &px) || px.rep) return NULL;
     if (px.pos >= avail) return NULL;
     u8 op = code[px.pos];
     bool is_jz;
@@ -11429,7 +11685,8 @@ static nj_block_t *nj_compile_bytewalk_loop(CPUI386 *cpu, uword start_ip)
         return NULL;
 
     nj_v6_pfx_t p1;
-    if (!nj_v6_prefix(cpu, code, avail, &p1) || !nj_bw_prefix1_ok(code, &p1) ||
+    if (!nj_v6_prefix(cpu, code, avail, &p1) || p1.rep ||
+        !nj_bw_prefix1_ok(code, &p1) ||
         p1.pos >= avail)
         return NULL;
 
@@ -11442,7 +11699,7 @@ static nj_block_t *nj_compile_bytewalk_loop(CPUI386 *cpu, uword start_ip)
 
     if (pos >= avail) return NULL;
     nj_v6_pfx_t p2;
-    if (!nj_v6_prefix(cpu, code + pos, avail - pos, &p2) ||
+    if (!nj_v6_prefix(cpu, code + pos, avail - pos, &p2) || p2.rep ||
         pos + p2.pos >= avail)
         return NULL;
 
@@ -11776,6 +12033,28 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
         nj_v6_pfx_t px;
         if (!nj_v6_prefix(cpu, code + pos, avail - pos, &px)) {
             NJ_V6_STOP[NJ_V6_PFX_BAD]++;
+            {
+                /* px.pos stopped on the byte that was refused. */
+                const u8 pfx = code[pos + px.pos];
+                if (pfx == 0xf3u) NJ_V6_STOP[NJ_V6_PFX_REP]++;
+                else if (pfx == 0xf2u) NJ_V6_STOP[NJ_V6_PFX_REP + 1u]++;
+                else NJ_V6_STOP[NJ_V6_PFX_REP + 2u]++;
+                if (pos + px.pos + 1u < avail) {
+                    const u8 so = code[pos + px.pos + 1u];
+                    unsigned k;
+                    switch (so) {
+                    case 0xa4: k = 0; break;
+                    case 0xa5: k = 1; break;
+                    case 0xa6: k = 2; break;
+                    case 0xa7: k = 3; break;
+                    case 0xaa: k = 4; break;
+                    case 0xab: k = 5; break;
+                    case 0xac: case 0xad: k = 6; break;
+                    default: k = 7; break;
+                    }
+                    NJ_V6_STOP[NJ_V6_PFX_STR + k]++;
+                }
+            }
             break;
         }
         if (px.pos >= avail - pos) { NJ_V6_STOP[NJ_V6_PFX_ROOM]++; break; }
@@ -11788,6 +12067,29 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
         }
 
         unsigned op_pos = pos + px.pos;
+        /* A REP is carried only into the string instruction below; anything
+         * else in front of it ends the trace exactly as the wholesale
+         * refusal in nj_v6_prefix() used to. */
+        if (px.rep && code[op_pos] != 0xa4u) {
+            NJ_V6_STOP[NJ_V6_PFX_BAD]++;
+            NJ_V6_STOP[NJ_V6_PFX_REP]++;
+            {
+                const u8 so = code[op_pos];
+                unsigned k;
+                switch (so) {
+                case 0xa4: k = 0; break;
+                case 0xa5: k = 1; break;
+                case 0xa6: k = 2; break;
+                case 0xa7: k = 3; break;
+                case 0xaa: k = 4; break;
+                case 0xab: k = 5; break;
+                case 0xac: case 0xad: k = 6; break;
+                default: k = 7; break;
+                }
+                NJ_V6_STOP[NJ_V6_PFX_STR + k]++;
+            }
+            break;
+        }
         nj_stop_op = code[op_pos];
         nj_stop_modrm = (op_pos + 1u < avail) ? code[op_pos + 1u] : 0u;
         nj_stop_op2 = (code[op_pos] == 0x0fu && op_pos + 1u < avail)
@@ -11902,6 +12204,42 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
                 break;
             }
             continue;
+        }
+
+        /*
+         * A forward unconditional jump inside a trace costs nothing to
+         * follow: move the decode cursor to the target and emit nothing.
+         *
+         * Only the first instruction of a trace was handled before, so an
+         * EB anywhere else ended the trace.  On Quadrax that is 192 of
+         * 1286 stops - 14.9%, second only to the deliberate CALL exit -
+         * and it is why traces there average 19.5 instructions while the
+         * game runs at 1.2% native coverage and 2.0 MIPS.
+         *
+         * Forward only.  A backward jump is a loop, and following it would
+         * either spin the decoder or duplicate the body; the existing
+         * terminal-exit path already handles those correctly.  The jump
+         * still retires, so insns is incremented even though no code is
+         * emitted, or the block would under-report and the cycle count
+         * would drift.
+         */
+        if (px.pos == 0u && (op == 0xe9 || op == 0xeb) && pos != 0u) {
+            unsigned dw = px.op16 ? 2u : 4u;
+            unsigned blen = op == 0xeb ? 2u : 1u + dw;
+            if (op_pos + blen <= avail) {
+                sword d = op == 0xeb ? (s8)code[op_pos + 1u]
+                                     : (dw == 2u ? (s16)nj_rd16(code + op_pos + 1u)
+                                                 : (s32)nj_rd32(code + op_pos + 1u));
+                unsigned np = op_pos + blen + (unsigned)d;
+                /* forward, still inside the window, and no 16-bit wrap */
+                if (d > 0 && np < avail &&
+                    (!trace16 || start_ip + np <= 0xffffu)) {
+                    pos = np;
+                    last_ip = gip;
+                    insns++;
+                    continue;
+                }
+            }
         }
 
         /* Unconditional relative branches are cheap terminal native blocks;
@@ -13029,6 +13367,32 @@ static nj_block_t *nj_compile_v6_trace(CPUI386 *cpu, uword start_ip)
                     pos=immpos+size;done=true;
                 }
             }
+        }
+
+        /* ---- REP MOVSB ---------------------------------------------- */
+        if (!done && px.rep && op == 0xa4) {
+            const bool reg16 = mixed_v86 ? false : trace16;
+            const int mseg = px.seg >= 0 ? px.seg : SEG_DS;
+            const u32 packed = 1u | (px.addr16 ? 0x100u : 0u)
+                             | ((u32)(unsigned)mseg << 16);
+            nj_v6_guard_t g;
+            memset(&g, 0, sizeof(g));
+            /* The helper reads and writes CX, SI and DI in the CPU
+             * structure, so the pinned copies go out and come back. */
+            nj_emit_store_guest(&e, reg16);
+            if (!nj_v8_emit_rep_movs(&e, packed)) {
+                e.p = emit_before; e.failed = false; pos = ipos; break;
+            }
+            nj_emit_load_guest(&e, reg16);
+            nj_cmp_imm0(&e, 2);
+            nj_v6_guard_add(&e, &g, 0u);   /* EQ => handed back, redo it */
+            if (!nj_v8_finish_guard(&e, &g, &exits, gip, insns)) {
+                e.p = emit_before; e.failed = false; exits.n = exits_before;
+                pos = ipos; break;
+            }
+            nj_trace_stored = true;
+            pos = op_pos + 1u;
+            done = true;
         }
 
         /* ---- moffs A0-A3 -------------------------------------------- */
@@ -15017,6 +15381,7 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	int off = no << 3;
 	if (off + 7 > cpu->idt.limit) {
 		dolog("call_isr error0 %d %d\n", off, cpu->idt.limit);
+		NJ_ISR_NOTE(1, 0, 0);
 		THROW(EX_GP, off | 2 | ext);
 	}
 
@@ -15028,15 +15393,17 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	int gt = (w2 >> 8) & 0xf;
 	if (gt != 6 && gt != 7 && gt != 0xe && gt != 0xf && gt != 5) {
 //		dolog("call_isr error1 gt=%d\n", gt);
+		NJ_ISR_NOTE(2, w1, w2);
 		THROW(EX_GP, off | 2 | ext);
 	}
 
 	int dpl = (w2 >> 13) & 0x3;
-	if (!ext && dpl < cpu->cpl) THROW(EX_GP, off | 2);
+	if (!ext && dpl < cpu->cpl) { NJ_ISR_NOTE(3, w1, w2); THROW(EX_GP, off | 2); }
 
 	int p = (w2 >> 15) & 1;
 	if (!p) {
 		dolog("call_isr error3\n");
+		NJ_ISR_NOTE(4, w1, w2);
 		THROW(EX_NP, off | 2 | ext);
 	}
 
@@ -15468,11 +15835,83 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 
 void cpui386_step(CPUI386 *cpu, int stepcount)
 {
+#if GUEST_PC_DIAG
+	/*
+	 * Where the guest is, sampled once every sixteen calls.
+	 *
+	 * A game that hangs with the CPU busy - park and zoop both spin after
+	 * the DOS/4GW banner at 74% native coverage - says nothing through the
+	 * exception counters or the JIT statistics: nothing faults and nothing
+	 * is refused.  The only question is which address it is going round.
+	 * The ring is in the PSRAM diagnostic hole, so it costs no SRAM.
+	 */
+	{
+		static u32 nj_pcsample_tick;
+		/*
+		 * Slot 4 freezes the ring.  A guest that jumps into unmapped
+		 * memory faults on every step afterwards, so a running ring
+		 * holds nothing but the storm; frozen at the first invalid
+		 * opcode it holds the path that got there instead.  Slot 5
+		 * selects every step rather than every sixteenth, which is what
+		 * that path needs.
+		 */
+		if (!((volatile u32 *)(0x11000000u + 0x000ab000u))[4] &&
+		    (++nj_pcsample_tick &
+		     (((volatile u32 *)(0x11000000u + 0x000ab000u))[5] ? 0u : 15u)) == 0u) {
+			volatile u32 *r = (volatile u32 *)(0x11000000u + 0x000ab000u);
+			const u32 h = r[0] % 256u;
+			/*
+			 * The physical address too: under EMM386 the guest runs
+			 * paged, so a linear EIP says nothing about where the
+			 * bytes are and the host cannot read the instruction that
+			 * is spinning.  translate8r() is the interpreter's own
+			 * read path; it can raise, so the exception record is put
+			 * back afterwards.
+			 */
+			OptAddr res;
+			const int save_excno = cpu->excno;
+			const uword save_excerr = cpu->excerr;
+			u32 phys = 0xffffffffu;
+			if (translate8r(cpu, &res, SEG_CS, cpu->ip))
+				phys = (u32)res.addr1;
+			cpu->excno = save_excno;
+			cpu->excerr = save_excerr;
+			/*
+			 * A probe the host can point anywhere: slot 1 holds a
+			 * linear address, and slots 2 and 3 come back with its
+			 * physical address and the dword there.  Without it a
+			 * paged guest's variables cannot be read from outside at
+			 * all - the page tables are the guest's, not ours.
+			 */
+			if (r[1]) {
+				OptAddr pr;
+				if (translate8r(cpu, &pr, SEG_DS, r[1])) {
+					r[2] = (u32)pr.addr1;
+					r[3] = *(volatile u32 *)(0x11000000u + pr.addr1);
+				} else {
+					r[2] = 0xffffffffu;
+					r[3] = 0;
+				}
+				cpu->excno = save_excno;
+				cpu->excerr = save_excerr;
+			}
+			r[8u + 3u * h] = cpu->seg[SEG_CS].base;
+			r[8u + 3u * h + 1u] = cpu->ip | (cpu->halt ? 0x80000000u : 0u);
+			r[8u + 3u * h + 2u] = phys;
+			r[0]++;
+		}
+	}
+#endif
+
 	frank_diag_trace(cpu->seg[SEG_CS].base, cpu->ip);
 	if ((cpu->flags & IF) && cpu->intr) {
 		cpu->intr = false;
 		cpu->halt = false;
 		int no = cpu->cb.pic_read_irq(cpu->cb.pic);
+		/* The request was withdrawn or masked before we got here, so
+		 * INTR is no longer asserted and there is nothing to take; see
+		 * i8259_read_irq(). */
+		if (no < 0) goto no_irq;
 		g_wl_hw_irq++;
 		cpu->ip = cpu->next_ip;
 		if (!call_isr(cpu, no, false, 1)) {
@@ -15482,6 +15921,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			}
 		}
 	}
+no_irq:
 
 	if (cpu->halt) {
 		usleep(1);
@@ -15506,6 +15946,35 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		{
 			volatile u32 *ex_ = NJ_V6_STOP;
 			if ((unsigned)cpu->excno < 32u) ex_[NJ_V6_EXC + cpu->excno]++;
+			/* Freeze the guest PC ring on the first invalid opcode, so
+			 * it keeps the path in rather than the storm after. */
+			if (cpu->excno == EX_UD) {
+				volatile u32 *pcs = (volatile u32 *)(0x11000000u + 0x000ab000u);
+				if (!pcs[4]) { pcs[4] = 1u; pcs[6] = cpu->ip; pcs[7] = cpu->seg[SEG_CS].base; }
+			}
+			if ((unsigned)cpu->excno < (unsigned)NJ_V6_EXC_EACH_N) {
+				volatile u32 *slot = &ex_[NJ_V6_EXC_EACH + 4u * (unsigned)cpu->excno];
+				if (!slot[3]) {
+					slot[0] = (u32)cpu->excerr;
+					slot[1] = (u32)cpu->seg[SEG_CS].base;
+					slot[2] = (u32)cpu->ip;
+					slot[3] = 1u;
+				}
+			}
+			if (!ex_[NJ_V6_EXC_FIRST_SEEN]) {
+				ex_[NJ_V6_EXC_FIRST_NO]  = (u32)cpu->excno;
+				ex_[NJ_V6_EXC_FIRST_ERR] = (u32)cpu->excerr;
+				ex_[NJ_V6_EXC_FIRST_CS]  = (u32)cpu->seg[SEG_CS].base;
+				ex_[NJ_V6_EXC_FIRST_IP]  = (u32)cpu->ip;
+				ex_[NJ_V6_EXC_FIRST_SEEN] = 1u;
+			} else if (!ex_[NJ_V6_EXC_SECOND_SEEN] &&
+			           (u32)cpu->excno != ex_[NJ_V6_EXC_FIRST_NO]) {
+				ex_[NJ_V6_EXC_SECOND_NO]  = (u32)cpu->excno;
+				ex_[NJ_V6_EXC_SECOND_ERR] = (u32)cpu->excerr;
+				ex_[NJ_V6_EXC_SECOND_CS]  = (u32)cpu->seg[SEG_CS].base;
+				ex_[NJ_V6_EXC_SECOND_IP]  = (u32)cpu->ip;
+				ex_[NJ_V6_EXC_SECOND_SEEN] = 1u;
+			}
 			ex_[NJ_V6_EXC_LAST_NO]  = (u32)cpu->excno;
 			ex_[NJ_V6_EXC_LAST_ERR] = (u32)cpu->excerr;
 			ex_[NJ_V6_EXC_LAST_CS]  = (u32)cpu->seg[SEG_CS].base;
@@ -15669,6 +16138,23 @@ void cpui386_diag_mode(CPUI386 *cpu, u32 out[5])
 
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 {
+	/*
+	 * Clear the diagnostic latches.
+	 *
+	 * They live in the PSRAM hole at guest physical 0xa8000, and psram_test()
+	 * does not leave the whole of it zeroed - slots read back as values like
+	 * 997109, which is enough to make a "have I latched yet" flag say yes
+	 * before anything has happened.  Two diagnostics were read as real
+	 * findings that way before this was noticed, so zero them here, once, at
+	 * the only point that is guaranteed to run after the memory test and
+	 * before the guest.
+	 */
+	{
+		volatile u32 *d_ = (volatile u32 *)(0x11000000u + 0x000a8000u);
+		for (unsigned k = NJ_V6_EXC; k <= NJ_V6_ISR_SEEN; k++)
+			d_[k] = 0u;
+	}
+
 	CPUI386 *cpu = malloc(sizeof(CPUI386));
 	switch (gen) {
 	case 3: cpu->flags_mask = EFLAGS_MASK_386; break;

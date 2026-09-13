@@ -3,6 +3,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 typedef int (*IsaDmaTransferHandler)(void *opaque, int nchan, int dma_pos, int dma_len);
+/*
+ * How many bytes this channel's owner has taken from memory but not yet
+ * played.  See the count register read in i8257_read_chan().
+ */
+typedef int (*IsaDmaQueuedHandler)(void *opaque, int nchan);
 
 typedef struct I8257Regs {
     int now[2];
@@ -13,6 +18,7 @@ typedef struct I8257Regs {
     uint8_t dack;
     uint8_t eop;
     IsaDmaTransferHandler transfer_handler;
+    IsaDmaQueuedHandler queued_handler;
     void *opaque;
 } I8257Regs;
 
@@ -54,12 +60,15 @@ void i8257_write_chan(void *opaque, hwaddr nport, uint64_t data,
                       unsigned int size);
 
 uint64_t i8257_read_cont(void *opaque, hwaddr nport, unsigned size);
+void i8257_diag_note_reader(uint32_t cs, uint32_t ip, uint32_t val);
 void i8257_write_cont(void *opaque, hwaddr nport, uint64_t data,
                       unsigned int size);
 
 void i8257_dma_register_channel(IsaDma *obj, int nchan,
                                 IsaDmaTransferHandler transfer_handler,
                                 void *opaque);
+void i8257_dma_set_queued_handler(IsaDma *obj, int nchan,
+                                  IsaDmaQueuedHandler queued_handler);
 void i8257_dma_hold_DREQ(IsaDma *obj, int nchan);
 void i8257_dma_release_DREQ(IsaDma *obj, int nchan);
 int i8257_dma_read_memory(IsaDma *obj, int nchan, void *buf, int pos,

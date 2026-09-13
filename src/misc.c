@@ -384,6 +384,16 @@ uint8_t cmos_ioport_read(CMOS *cmos, int addr)
 		return 0xff;
 	cmos_update_time(cmos);
 	uint8_t val = cmos->data[cmos->index];
+	/*
+	 * Reading Status Register C clears it on a real MC146818, which is how
+	 * the periodic-interrupt handler knows it has consumed the event.  We
+	 * only ever set IRQF|PF here and never cleared it, so a handler that
+	 * loops "out 70h,0Ch / in al,71h / test al,0E0h / jnz" - AT-SLOW.COM,
+	 * shipped with Theme Park, does exactly that - never left the loop and
+	 * the game hung before DOS/4GW was even reached.
+	 */
+	if (cmos->index == RTC_REG_C)
+		cmos->data[RTC_REG_C] = 0;
 	return val;
 }
 

@@ -47,7 +47,7 @@ static uint8_t volume = 0; // 0 - MAX vol, 16 - silece (for i2s, for pwm - 12)
  */
 i2s_config_t i2s_get_default_config(void) {
     i2s_config_t i2s_config = {
-            .sample_freq = 44100,
+            .sample_freq = SOUND_FREQUENCY,   /* audio_init() re-asserts this */
             .channel_count = 2,
     		.data_pin = I2S_DATA_PIN,
 	    	.clock_pin_base = I2S_CLOCK_PIN_BASE,
@@ -290,7 +290,7 @@ void __not_in_flash_func(i2s_dma_write)(i2s_config_t *i2s_config, const int16_t 
             const int32_t d = (int32_t)(t_enter - i2s_last_start_us);
             const uint32_t elapsed = d > 0 ? (uint32_t)d : 0u;
             /* One stereo frame at the configured rate, in microseconds. */
-            const uint32_t period = 1000000u / 44100u;
+            const uint32_t period = 1000000u / i2s_config->sample_freq;
             const uint32_t over = elapsed > period ? elapsed - period : 0u;
             if (over > g_i2s_late_us) g_i2s_late_us = over;
         }
@@ -400,10 +400,17 @@ uint8_t audio_get_volume(void) {
 }
 
 
+/* Read by tests/jit/run_sb_pcm.py and by the SWD audio tooling; see
+ * audio.h.  It has to be volatile: as a plain const the compiler folds its
+ * value into the one load below, leaving the section unreferenced, and
+ * --gc-sections then drops the symbol out of the ELF entirely.
+ */
+const volatile uint32_t g_audio_out_hz = SOUND_FREQUENCY;
+
 void audio_init(void) {
 #if FEATURE_AUDIO_I2S
     i2s_config = i2s_get_default_config();
-    i2s_config.sample_freq = SOUND_FREQUENCY;
+    i2s_config.sample_freq = g_audio_out_hz;
     i2s_config.dma_trans_count = 1;
     i2s_config.dma_buf = i2s_dma_buf;   /* static: keep core 1 off the heap */
     i2s_volume(&i2s_config, 0);
