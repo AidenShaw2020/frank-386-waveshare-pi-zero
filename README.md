@@ -12,6 +12,11 @@ i386 PC Emulator for RP2350 (Raspberry Pi Pico 2) with VGA/HDMI output, SD card 
 
 Based on [Tiny386](https://github.com/hchunhui/tiny386) by Chunhui He.
 
+## Related project
+
+Looking for support Raspberry Pi3 rather
+than RP2350? [X86Pi] https://github.com/AidenShaw2020/x86pi/tree/main
+
 ## Features
 
 - Full i386 (and partially i486/i586) CPU emulation with optional x87 FPU
